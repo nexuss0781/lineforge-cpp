@@ -1,0 +1,41 @@
+name: Hugging Face token diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hf-token-check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check repository-scoped HF_TOKEN
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        shell: bash
+        run: |
+          set +x
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "HF_TOKEN missing; configure it as a repository Actions secret."
+            exit 1
+          fi
+
+          status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --max-time 20 \
+              --header "Authorization: Bearer ${HF_TOKEN}" \
+              https://huggingface.co/api/whoami-v2 2>/dev/null
+          )" || {
+            echo "Hugging Face authentication request failed; HTTP status: ${status:-000}"
+            exit 1
+          }
+
+          if [[ "$status" == "200" ]]; then
+            echo "HF_TOKEN authentication passed; HTTP status: 200"
+          else
+            echo "HF_TOKEN authentication failed; HTTP status: $status"
+            exit 1
+          fi
