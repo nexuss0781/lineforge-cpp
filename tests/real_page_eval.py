@@ -54,8 +54,10 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     roi = as_box(page["roi_xyxy"]) if page.get("roi_xyxy") else None
     truth = [as_box(b) for b in page["ground_truth_xyxy"]]
-    predicted = [as_box(line["bbox_xyxy"]) for line in manifest.get("lines", [])]
+    line_items = manifest.get("lines", [])
+    predicted = [as_box(line["bbox_xyxy"]) for line in line_items]
     predicted = [box for box in predicted if inside_roi(box, roi)]
+    selected_items = [line for line in line_items if inside_roi(as_box(line["bbox_xyxy"]), roi)]
 
     pairs: list[tuple[float, int, int]] = []
     for pi, pred in enumerate(predicted):
@@ -87,10 +89,15 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
             gt_coverage = overlap / area(gt)
             if gt_coverage >= 0.20:
                 coverage_by_truth[gi].append((pi, gt_coverage))
-            if pred_coverage >= 0.20:
+            # A wide crop can fully swallow an indented/short line while that
+            # line occupies less than 20% of the crop's area. Count either a
+            # meaningful fraction of the crop or most of a labeled line as
+            # evidence that the candidate may contain multiple lines.
+            if pred_coverage >= 0.15 or gt_coverage >= 0.50:
                 coverage_by_pred[pi].append((gi, pred_coverage))
 
     cut_truth = 0
+    cut_predictions: set[int] = set()
     for gi, overlaps in enumerate(coverage_by_truth):
         if not overlaps:
             continue
@@ -103,9 +110,31 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         # should not be reported as cut glyphs.
         if width_coverage < 0.80 or height_coverage < 0.50:
             cut_truth += 1
+            cut_predictions.add(pi)
     split_truth = sum(len(overlaps) > 1 for overlaps in coverage_by_truth)
     merged_predictions = sum(len(overlaps) > 1 for overlaps in coverage_by_pred)
     tp = len(matched_pred)
+    error_predictions = set(range(len(predicted))) - matched_pred
+    error_predictions.update(cut_predictions)
+    error_predictions.update(i for i, overlaps in enumerate(coverage_by_pred) if len(overlaps) > 1)
+    error_predictions.update(i for overlaps in coverage_by_truth if len(overlaps) > 1
+                             for i, _ in overlaps)
+    review_prediction_indices = {
+        i for i, item in enumerate(selected_items) if item.get("review_required", False)
+    }
+    flagged_error_predictions = error_predictions & review_prediction_indices
+    excluded_items = manifest.get("excluded", [])
+    selected_excluded = [item for item in excluded_items
+                         if inside_roi(as_box(item["bbox_xyxy"]), roi)]
+    review_items = len(review_prediction_indices) + sum(
+        bool(item.get("review_required", item.get("review", True))) for item in selected_excluded
+    )
+    candidate_count = len(predicted) + len(selected_excluded)
+    page_has_error = bool(
+        len(truth) - len(matched_truth) or error_predictions or cut_truth or
+        merged_predictions or split_truth
+    )
+    page_has_review_alert = review_items > 0
     return {
         "name": page.get("name", manifest_path.stem),
         "iou_threshold": threshold,
@@ -119,6 +148,15 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         "cut_lines": cut_truth,
         "merged_crops": merged_predictions,
         "split_lines": split_truth,
+        "review_candidates": review_items,
+        "review_candidate_rate": round(review_items / candidate_count, 4) if candidate_count else 0.0,
+        "candidate_count_including_excluded": candidate_count,
+        "crop_error_candidates": len(error_predictions),
+        "reviewed_crop_errors": len(flagged_error_predictions),
+        "crop_error_review_recall": (round(len(flagged_error_predictions) / len(error_predictions), 4)
+                                     if error_predictions else None),
+        "page_has_segmentation_error": page_has_error,
+        "page_has_review_alert": page_has_review_alert,
         "matches": matches,
     }
 
@@ -142,6 +180,12 @@ def main() -> int:
     total_gt = sum(page["ground_truth_lines"] for page in pages)
     total_pred = sum(page["predicted_crops"] for page in pages)
     total_tp = sum(page["true_positive_matches"] for page in pages)
+    total_candidates = sum(page["candidate_count_including_excluded"] for page in pages)
+    total_reviews = sum(page["review_candidates"] for page in pages)
+    total_crop_errors = sum(page["crop_error_candidates"] for page in pages)
+    total_reviewed_crop_errors = sum(page["reviewed_crop_errors"] for page in pages)
+    error_pages = [page for page in pages if page["page_has_segmentation_error"]]
+    reviewed_error_pages = sum(page["page_has_review_alert"] for page in error_pages)
     result = {
         "benchmark": "hand-labeled line-crop evaluation",
         "matching": f"greedy one-to-one IoU >= {threshold:.3f}; boxes are xyxy with exclusive right/bottom edges",
@@ -157,6 +201,16 @@ def main() -> int:
             "cut_lines": sum(page["cut_lines"] for page in pages),
             "merged_crops": sum(page["merged_crops"] for page in pages),
             "split_lines": sum(page["split_lines"] for page in pages),
+            "review_candidates": total_reviews,
+            "candidate_count_including_excluded": total_candidates,
+            "review_candidate_rate": round(total_reviews / total_candidates, 4) if total_candidates else 0.0,
+            "crop_error_candidates": total_crop_errors,
+            "reviewed_crop_errors": total_reviewed_crop_errors,
+            "crop_error_review_recall": (round(total_reviewed_crop_errors / total_crop_errors, 4)
+                                         if total_crop_errors else None),
+            "pages_with_segmentation_errors": len(error_pages),
+            "error_page_review_recall": (round(reviewed_error_pages / len(error_pages), 4)
+                                         if error_pages else None),
         },
     }
     output = json.dumps(result, ensure_ascii=False, indent=2)
