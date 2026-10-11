@@ -1,18 +1,23 @@
 #include <algorithm>
 #include <array>
-#include <cmath>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <jpeglib.h>
@@ -216,6 +221,96 @@ static void write_png_gray(const fs::path& path, const Image& image) {
     require(png_image_write_to_file(&png, path.c_str(), 0, image.pixels.data(), 0, nullptr) != 0,
             "cannot write PNG: " + std::string(png.message));
 }
+
+class OutputDirectoryTransaction {
+public:
+    explicit OutputDirectoryTransaction(const std::string& output) {
+        target_ = fs::absolute(fs::path(output)).lexically_normal();
+        require(!target_.filename().empty(), "--output must name a directory, not a filesystem root");
+        std::error_code ec;
+        fs::create_directories(target_.parent_path(), ec);
+        if (ec) throw std::runtime_error("cannot create output parent directory: " + ec.message());
+
+        for (int attempt = 0; attempt < 1000; ++attempt) {
+            const fs::path candidate = unique_sibling("stage");
+            ec.clear();
+            if (fs::create_directory(candidate, ec)) {
+                staging_ = candidate;
+                return;
+            }
+            if (ec && ec != std::errc::file_exists)
+                throw std::runtime_error("cannot create staging output directory: " + ec.message());
+        }
+        throw std::runtime_error("cannot allocate a unique staging output directory");
+    }
+
+    OutputDirectoryTransaction(const OutputDirectoryTransaction&) = delete;
+    OutputDirectoryTransaction& operator=(const OutputDirectoryTransaction&) = delete;
+
+    ~OutputDirectoryTransaction() {
+        if (!committed_) {
+            std::error_code ignored;
+            fs::remove_all(staging_, ignored);
+        }
+    }
+
+    const fs::path& staging_path() const { return staging_; }
+
+    void commit() {
+        std::error_code status_error;
+        const fs::file_status status = fs::symlink_status(target_, status_error);
+        if (status_error == std::errc::no_such_file_or_directory) status_error.clear();
+        if (status_error)
+            throw std::runtime_error("cannot inspect existing output path: " + status_error.message());
+
+        const bool has_existing_output = status.type() != fs::file_type::not_found;
+        fs::path backup;
+        if (has_existing_output) {
+            require(fs::is_directory(status), "--output exists and is not a directory");
+            backup = unique_sibling("backup");
+            std::error_code move_error;
+            fs::rename(target_, backup, move_error);
+            if (move_error)
+                throw std::runtime_error("cannot stage previous output directory: " + move_error.message());
+        }
+
+        std::error_code publish_error;
+        fs::rename(staging_, target_, publish_error);
+        if (publish_error) {
+            if (has_existing_output) {
+                std::error_code restore_error;
+                fs::rename(backup, target_, restore_error);
+                if (restore_error)
+                    throw std::runtime_error("cannot publish output directory: " + publish_error.message() +
+                                             "; previous output could not be restored from " + backup.string() +
+                                             ": " + restore_error.message());
+            }
+            throw std::runtime_error("cannot publish output directory: " + publish_error.message());
+        }
+        committed_ = true;
+        if (has_existing_output) {
+            std::error_code cleanup_error;
+            fs::remove_all(backup, cleanup_error);
+            if (cleanup_error)
+                std::cerr << "linecrop: warning: new output was published, but previous output remains at "
+                          << backup << ": " << cleanup_error.message() << "\n";
+        }
+    }
+
+private:
+    fs::path unique_sibling(const char* purpose) const {
+        static std::atomic<uint64_t> sequence{0};
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto serial = sequence.fetch_add(1, std::memory_order_relaxed);
+        return target_.parent_path() /
+               (target_.filename().string() + ".linecrop-" + purpose + "-" +
+                std::to_string(stamp) + "-" + std::to_string(serial));
+    }
+
+    fs::path target_;
+    fs::path staging_;
+    bool committed_ = false;
+};
 
 static int otsu_threshold(const Image& image) {
     std::array<uint64_t, 256> hist{};
@@ -1316,8 +1411,14 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
     }
 }
 
-static Image crop_with_white_padding(const Image& gray, const Band& b,
-                                     std::array<int, 4>* source_bbox = nullptr) {
+struct CropGeometry {
+    std::array<int, 4> source_bbox{};
+    int width = 0;
+    int height = 0;
+    int border = 0;
+};
+
+static CropGeometry crop_geometry(const Image& gray, const Band& b) {
     const int ink_y0 = b.ink_y0 >= 0 ? b.ink_y0 : b.y0;
     const int ink_y1 = b.ink_y1 >= ink_y0 ? b.ink_y1 : b.y1;
     const int line_h = ink_y1 - ink_y0 + 1;
@@ -1342,13 +1443,114 @@ static Image crop_with_white_padding(const Image& gray, const Band& b,
     const int y0 = b.crop_y0 >= 0 ? b.crop_y0 : std::max(0, b.y0 - pad_y);
     const int y1 = b.crop_y1 >= y0 ? b.crop_y1 : std::min(gray.height - 1, b.y1 + pad_y);
     const int ow = x1 - x0 + 1, oh = y1 - y0 + 1;
-    if (source_bbox) *source_bbox = {x0, y0, x1 + 1, y1 + 1};
     const int border = std::max(2, static_cast<int>(std::lround(line_h * 0.10)));
-    Image out{ow + 2 * border, oh + 2 * border, std::vector<uint8_t>(static_cast<size_t>(ow + 2 * border) * (oh + 2 * border), 255)};
-    for (int y = 0; y < oh; ++y)
-        std::copy_n(gray.pixels.begin() + static_cast<size_t>(y0 + y) * gray.width + x0, ow,
-                    out.pixels.begin() + static_cast<size_t>(y + border) * out.width + border);
+    return CropGeometry{{x0, y0, x1 + 1, y1 + 1}, ow + 2 * border, oh + 2 * border, border};
+}
+
+static Image crop_with_white_padding(const Image& gray, const CropGeometry& geometry) {
+    const int source_width = geometry.source_bbox[2] - geometry.source_bbox[0];
+    const int source_height = geometry.source_bbox[3] - geometry.source_bbox[1];
+    Image out{geometry.width, geometry.height,
+              std::vector<uint8_t>(static_cast<size_t>(geometry.width) * geometry.height, 255)};
+    for (int y = 0; y < source_height; ++y)
+        std::copy_n(gray.pixels.begin() + static_cast<size_t>(geometry.source_bbox[1] + y) * gray.width +
+                        geometry.source_bbox[0], source_width,
+                    out.pixels.begin() + static_cast<size_t>(y + geometry.border) * out.width + geometry.border);
     return out;
+}
+
+struct CropWriteJob {
+    size_t band_index = 0;
+    std::string name;
+    CropGeometry geometry;
+};
+
+static void mask_crop_to_curved_region(Image& crop, const LayoutRegion& region,
+                                       const std::array<int, 4>& source_bbox);
+
+static void write_crop_batch(const Image& processed, const std::vector<Band>& bands,
+                             const std::vector<LayoutRegion>& regions,
+                             const std::vector<CropWriteJob>& jobs, const fs::path& staging) {
+    if (jobs.empty()) return;
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    const size_t available_threads = hardware_threads == 0 ? 1 : hardware_threads;
+    const size_t worker_count = std::min({size_t{4}, available_threads, jobs.size()});
+    constexpr size_t max_in_flight_crop_bytes = 64u * 1024u * 1024u;
+
+    if (worker_count <= 1) {
+        for (const auto& job : jobs) {
+            const auto& band = bands[job.band_index];
+            Image crop = crop_with_white_padding(processed, job.geometry);
+            if (band.region > 0 && static_cast<size_t>(band.region) <= regions.size())
+                mask_crop_to_curved_region(crop, regions[static_cast<size_t>(band.region - 1)],
+                                           job.geometry.source_bbox);
+            write_png_gray(staging / job.name, crop);
+        }
+        return;
+    }
+
+    std::atomic<size_t> next_job{0};
+    std::atomic<bool> failed{false};
+    std::mutex memory_mutex;
+    std::condition_variable memory_available;
+    size_t in_flight_crop_bytes = 0;
+    std::mutex error_mutex;
+    std::exception_ptr first_error;
+
+    const auto worker = [&]() {
+        while (!failed.load(std::memory_order_acquire)) {
+            const size_t job_index = next_job.fetch_add(1, std::memory_order_relaxed);
+            if (job_index >= jobs.size()) return;
+            const auto& job = jobs[job_index];
+            const size_t crop_bytes = static_cast<size_t>(job.geometry.width) *
+                                      static_cast<size_t>(job.geometry.height);
+            {
+                std::unique_lock<std::mutex> lock(memory_mutex);
+                memory_available.wait(lock, [&]() {
+                    return failed.load(std::memory_order_acquire) || in_flight_crop_bytes == 0 ||
+                           (in_flight_crop_bytes <= max_in_flight_crop_bytes &&
+                            crop_bytes <= max_in_flight_crop_bytes - in_flight_crop_bytes);
+                });
+                if (failed.load(std::memory_order_acquire)) return;
+                in_flight_crop_bytes += crop_bytes;
+            }
+
+            try {
+                const auto& band = bands[job.band_index];
+                Image crop = crop_with_white_padding(processed, job.geometry);
+                if (band.region > 0 && static_cast<size_t>(band.region) <= regions.size())
+                    mask_crop_to_curved_region(crop, regions[static_cast<size_t>(band.region - 1)],
+                                               job.geometry.source_bbox);
+                write_png_gray(staging / job.name, crop);
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!first_error) first_error = std::current_exception();
+                    failed.store(true, std::memory_order_release);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(memory_mutex);
+                in_flight_crop_bytes -= crop_bytes;
+            }
+            memory_available.notify_all();
+            if (failed.load(std::memory_order_acquire)) return;
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (size_t i = 0; i < worker_count; ++i) workers.emplace_back(worker);
+    } catch (...) {
+        failed.store(true, std::memory_order_release);
+        memory_available.notify_all();
+        for (auto& thread : workers) if (thread.joinable()) thread.join();
+        throw;
+    }
+    for (auto& thread : workers) thread.join();
+    if (first_error) std::rethrow_exception(first_error);
 }
 
 static void mask_crop_to_curved_region(Image& crop, const LayoutRegion& region,
@@ -1623,8 +1825,21 @@ int main(int argc, char** argv) {
                               << " right=" << crop_extents[i].gutter_right_x << "\n";
             }
         }
-        fs::create_directories(opt.output);
-        std::ofstream manifest(fs::path(opt.output) / "manifest.json");
+        OutputDirectoryTransaction output_transaction(opt.output);
+        std::vector<CropWriteJob> crop_jobs;
+        crop_jobs.reserve(bands.size());
+        for (size_t band_index = 0; band_index < bands.size(); ++band_index) {
+            const auto& b = bands[band_index];
+            if (b.page_number || b.non_text_fragment) continue;
+            const size_t line_number = crop_jobs.size() + 1;
+            const std::string name = "line_" +
+                (line_number < 10 ? std::string("000") : line_number < 100 ? std::string("00") :
+                 line_number < 1000 ? std::string("0") : std::string()) + std::to_string(line_number) + ".png";
+            crop_jobs.push_back(CropWriteJob{band_index, name, crop_geometry(processed, b)});
+        }
+        write_crop_batch(processed, bands, regions, crop_jobs, output_transaction.staging_path());
+
+        std::ofstream manifest(output_transaction.staging_path() / "manifest.json");
         require(manifest.good(), "cannot create manifest in output directory");
         manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"" << LINEFORGE_VERSION << "\",\n";
         manifest << "  \"input\": \"" << json_escape(fs::path(opt.input).filename().string()) << "\",\n";
@@ -1673,17 +1888,13 @@ int main(int argc, char** argv) {
         size_t kept = 0, skipped = 0;
         for (const auto& b : bands) {
             if (b.page_number || b.non_text_fragment) { ++skipped; continue; }
-            const std::string name = "line_" + (kept + 1 < 10 ? std::string("000") : kept + 1 < 100 ? std::string("00") : kept + 1 < 1000 ? std::string("0") : std::string()) + std::to_string(kept + 1) + ".png";
-            std::array<int, 4> source_crop_bbox{};
-            Image crop = crop_with_white_padding(processed, b, &source_crop_bbox);
-            if (b.region > 0 && static_cast<size_t>(b.region) <= regions.size())
-                mask_crop_to_curved_region(crop, regions[static_cast<size_t>(b.region - 1)], source_crop_bbox);
-            write_png_gray(fs::path(opt.output) / name, crop);
+            const auto& job = crop_jobs[kept];
+            const auto& source_crop_bbox = job.geometry.source_bbox;
             if (kept) manifest << ",\n";
-            manifest << "    {\"file\": \"" << name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
+            manifest << "    {\"file\": \"" << job.name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
                      << "], \"source_crop_bbox_xyxy\": [" << source_crop_bbox[0] << ", " << source_crop_bbox[1]
                      << ", " << source_crop_bbox[2] << ", " << source_crop_bbox[3] << "], \"crop_size\": ["
-                     << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
+                     << job.geometry.width << ", " << job.geometry.height << "], \"ink_pixels\": " << b.ink
                      << ", \"region\": " << b.region << ", \"parent_region_id\": " << b.region
                      << ", \"reading_order_index\": " << kept + 1
                      << ", \"relationship\": \"contained_by_region\", \"review_required\": "
@@ -1717,6 +1928,7 @@ int main(int argc, char** argv) {
                  << "},\n  \"detected_bands\": " << bands.size() << "\n}\n";
         manifest.close();
         require(manifest.good(), "failed while writing manifest");
+        output_transaction.commit();
         const auto end = std::chrono::steady_clock::now();
         if (opt.debug) {
             const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
