@@ -25,6 +25,28 @@ class RealPageEvaluatorTests(unittest.TestCase):
         self.assertEqual(result["precision"], 1.0)
         self.assertEqual(result["recall"], 1.0)
         self.assertEqual(result["missed_lines"], 0)
+        self.assertEqual(result["vertical_boundary"]["mean_absolute_top_error_px"], 0.0)
+        self.assertEqual(result["vertical_boundary"]["mean_absolute_bottom_error_px"], 0.0)
+
+    def test_vertical_boundaries_distinguish_clipping_from_excess_whitespace(self):
+        result = self.evaluate([[10, 12, 100, 28]], [[10, 10, 100, 30]])
+        vertical = result["vertical_boundary"]
+        self.assertEqual(vertical["mean_absolute_top_error_px"], 2.0)
+        self.assertEqual(vertical["mean_absolute_bottom_error_px"], 2.0)
+        self.assertEqual(vertical["top_clipped"], 1)
+        self.assertEqual(vertical["bottom_clipped"], 1)
+        self.assertEqual(vertical["top_excess_whitespace"], 0)
+        self.assertEqual(vertical["bottom_excess_whitespace"], 0)
+
+    def test_vertical_boundary_metrics_count_extra_margins_separately(self):
+        result = self.evaluate([[10, 8, 100, 33]], [[10, 10, 100, 30]])
+        vertical = result["vertical_boundary"]
+        self.assertEqual(vertical["top_excess_whitespace"], 1)
+        self.assertEqual(vertical["bottom_excess_whitespace"], 1)
+        self.assertEqual(vertical["top_clipped"], 0)
+        self.assertEqual(vertical["bottom_clipped"], 0)
+        self.assertEqual(vertical["top_within_3px"], 1)
+        self.assertEqual(vertical["bottom_within_3px"], 1)
 
     def test_horizontally_cut_line_is_counted(self):
         result = self.evaluate([[40, 10, 100, 30]], [[10, 10, 110, 30]])

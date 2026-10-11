@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
 
 
 def pseudo_ethiopic(draw, left, top, right, baseline, rng, ink, scale=1.0):
@@ -179,6 +179,96 @@ def run_dense_vertical_case(binary, work):
     }
     return {"case": "dense_vertical_profile", "pass": all(checks.values()),
             "checks": checks, "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
+
+
+def make_vertical_font_scale_fixture(path):
+    """Render close-spaced lines at several font sizes with known whitespace boundaries."""
+    im = Image.new("L", (1200, 720), 248)
+    lines = [
+        (15, "Agj pqy bdfhkl  small text with ascenders and descenders"),
+        (24, "Agj pqy bdfhkl  a medium text line with visible upper and lower forms"),
+        (37, "Agj pqy bdfhkl  LARGE text gives this row a much taller glyph envelope"),
+        (19, "Agj pqy bdfhkl  final small line after the large font"),
+    ]
+    draw = ImageDraw.Draw(im)
+    try:
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
+        fonts = [ImageFont.truetype(font_path, size) for size, _ in lines]
+    except OSError:
+        fonts = [ImageFont.load_default() for _ in lines]
+
+    ink_boxes = []
+    cursor_y = 145
+    for (size, text), font in zip(lines, fonts):
+        layer = Image.new("L", im.size, 255)
+        layer_draw = ImageDraw.Draw(layer)
+        layer_draw.text((90, cursor_y), text, font=font, fill=18)
+        bbox = ImageChops.difference(layer, Image.new("L", im.size, 255)).getbbox()
+        if bbox is None:
+            raise RuntimeError("synthetic font line unexpectedly rendered empty")
+        im.paste(layer.crop(bbox), bbox[:2])
+        ink_boxes.append(bbox)
+        # Keep line gaps shorter than a paragraph separator, while varying with
+        # font size rather than holding a fixed pixel pitch.
+        cursor_y = bbox[3] + max(6, round(size * 0.36))
+
+    # A vertical illumination gradient keeps the test from depending on a flat
+    # white background, without changing the hand-known glyph row envelopes.
+    px = im.load()
+    for y in range(im.height):
+        delta = int(14 * y / max(1, im.height - 1))
+        for x in range(im.width):
+            px[x, y] = min(255, px[x, y] + delta)
+    im.save(path, "PNG")
+
+    # The target is the midpoint of each visible whitespace valley. At the two
+    # block ends, use a scale-relative margin matching the engine's line-height
+    # convention, not a fixed image-coordinate allowance.
+    target = [[box[1], box[3]] for box in ink_boxes]
+    for i in range(len(target) - 1):
+        cut = round((ink_boxes[i][3] + ink_boxes[i + 1][1]) / 2)
+        target[i][1] = cut
+        target[i + 1][0] = cut
+    target[0][0] = max(0, ink_boxes[0][1] - max(1, round((ink_boxes[0][3] - ink_boxes[0][1]) * 0.18)))
+    target[-1][1] = ink_boxes[-1][3] + max(1, round((ink_boxes[-1][3] - ink_boxes[-1][1]) * 0.18))
+    return target
+
+
+def run_vertical_font_scale_case(binary, work):
+    source, out = work / "vertical_font_scales.png", work / "out_vertical_font_scales"
+    target = make_vertical_font_scale_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0 or not (out / "manifest.json").exists():
+        return {"case": "vertical_font_scales", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    boxes = sorted((item["bbox_xyxy"] for item in manifest["lines"]), key=lambda box: box[1])
+    errors = [(box[1] - expected[0], box[3] - expected[1])
+              for box, expected in zip(boxes, target)]
+    crop_row_groups = []
+    for item in manifest["lines"]:
+        crop = Image.open(out / item["file"]).convert("L")
+        pixels = crop.load()
+        active_rows = [y for y in range(crop.height)
+                       if sum(pixels[x, y] < 150 for x in range(crop.width)) >
+                       max(2, round(crop.width * 0.002))]
+        crop_row_groups.append(0 if not active_rows else
+                               1 + sum(y - previous > 3
+                                       for previous, y in zip(active_rows, active_rows[1:])))
+    checks = {
+        "four_different_font_sizes_detected": len(boxes) == len(target),
+        "top_boundaries_within_3px": len(boxes) == len(target) and all(abs(e[0]) <= 3 for e in errors),
+        "bottom_boundaries_within_3px": len(boxes) == len(target) and all(abs(e[1]) <= 3 for e in errors),
+        "neighboring_text_not_in_crops": len(crop_row_groups) == len(target) and all(n == 1 for n in crop_row_groups),
+        "row_order_is_monotonic": [box[1] for box in boxes] == sorted(box[1] for box in boxes),
+    }
+    return {"case": "vertical_font_scales", "pass": all(checks.values()),
+            "checks": checks, "top_bottom_error_px": errors,
+            "dark_row_groups_per_crop": crop_row_groups,
+            "elapsed_ms": round(elapsed_ms, 2), "line_count": len(boxes)}
 
 
 def make_edge_clipping_fixture(path):
@@ -370,7 +460,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.4.0" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 0.4.1" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -567,6 +657,7 @@ def main():
         results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
         results.append(run_row_noise_case(args.binary.resolve(), work))
         results.append(run_dense_vertical_case(args.binary.resolve(), work))
+        results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
         results.append(run_edge_clipping_case(args.binary.resolve(), work))
         results.append(run_heading_underline_case(args.binary.resolve(), work))
         results.extend(run_cli_cases(args.binary.resolve(), work))
@@ -585,6 +676,7 @@ def main():
             results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
             results.append(run_row_noise_case(args.binary.resolve(), work))
             results.append(run_dense_vertical_case(args.binary.resolve(), work))
+            results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
             results.append(run_edge_clipping_case(args.binary.resolve(), work))
             results.append(run_heading_underline_case(args.binary.resolve(), work))
             results.extend(run_cli_cases(args.binary.resolve(), work))
