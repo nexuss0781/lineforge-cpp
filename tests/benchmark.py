@@ -184,7 +184,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.1.0" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 0.2.0" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -198,6 +198,159 @@ def run_cli_cases(binary, work):
     results.append({"case": "cli_invalid_input", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"invalid_input_rejected": ok}})
     return results
+
+
+def draw_fixture_line(draw, font, left, right, y, seed):
+    """Draw a deterministic line-like phrase that nearly fills one text region."""
+    phrases = ("ARCHIVE TEXT SAMPLE 0123456789  ",
+               "COLUMN LAYOUT TEST EXAMPLE 987654321  ",
+               "READING ORDER AND REGION DETECTION  ")
+    text = phrases[seed % len(phrases)]
+    while draw.textlength(text, font=font) < right - left:
+        text += phrases[seed % len(phrases)]
+    while text and draw.textlength(text, font=font) > right - left:
+        text = text[:-1]
+    draw.text((left, y), text, font=font, fill=12)
+
+
+def make_layout_fixture(path, kind):
+    if kind == "newspaper":
+        size = (1200, 1000)
+    elif kind == "spread":
+        size = (1200, 1100)
+    else:
+        size = (1000, 1000)
+    im = Image.new("L", size, 255)
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+    except OSError:
+        font = ImageFont.load_default()
+    if kind == "spread":
+        for i, y in enumerate((150, 280, 410, 540)):
+            draw_fixture_line(draw, font, 70, 520, y, i)
+            draw_fixture_line(draw, font, 680, 1130, y, i + 1)
+        # Facing-page footers sit in the center of each leaf, not the spread.
+        draw.text((295, 930), "7", font=font, fill=12)
+        draw.text((895, 930), "8", font=font, fill=12)
+    elif kind in ("columns", "custom"):
+        for i, y in enumerate((140, 270, 400, 530)):
+            draw_fixture_line(draw, font, 55, 445, y, i)
+            draw_fixture_line(draw, font, 555, 945, y, i + 1)
+    elif kind == "newspaper":
+        try:
+            headline_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34)
+        except OSError:
+            headline_font = font
+        headline = "NEWSPAPER HEADLINE SPANS BOTH COLUMNS  "
+        while draw.textlength(headline, font=headline_font) < 1040:
+            headline += "NEWSPAPER HEADLINE  "
+        while draw.textlength(headline, font=headline_font) > 1040:
+            headline = headline[:-1]
+        draw.text((75, 70), headline, font=headline_font, fill=12)
+        for i, y in enumerate((220, 340, 460, 580)):
+            draw_fixture_line(draw, font, 70, 530, y, i)
+            draw_fixture_line(draw, font, 670, 1130, y + (25 if i == 2 else 0), i + 1)
+    im.save(path, "PNG")
+
+
+def run_layout_case(binary, work, kind, reading_order="ltr"):
+    source = work / f"layout_{kind}.png"
+    out = work / f"out_layout_{kind}_{reading_order}"
+    make_layout_fixture(source, "spread" if kind == "spread" else
+                        "newspaper" if kind == "newspaper" else "columns")
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out),
+                           "--reading-order", reading_order],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": f"layout_{kind}_{reading_order}", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": elapsed_ms}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    width = manifest["image_size"]["width"]
+    expected = 8 if kind in ("spread", "columns") else 9
+    centers = [(b["bbox_xyxy"][0] + b["bbox_xyxy"][2]) / 2 for b in lines]
+    if kind == "newspaper":
+        ordered = len(centers) == 9 and centers[0] > width * 0.35 and centers[0] < width * 0.65
+        left_start = 1
+    else:
+        ordered = len(centers) == 8
+        left_start = 0
+    if ordered:
+        first_half = centers[left_start:left_start + 4]
+        second_half = centers[left_start + 4:left_start + 8]
+        if reading_order == "rtl":
+            ordered = all(x > width * 0.5 for x in first_half) and all(x < width * 0.5 for x in second_half)
+        else:
+            ordered = all(x < width * 0.5 for x in first_half) and all(x > width * 0.5 for x in second_half)
+    expected_excluded = 2 if kind == "spread" else 0
+    checks = {
+        "line_count": len(lines) == expected,
+        "layout_regions_reported": bool(manifest["layout"]["regions"]),
+        "requested_reading_order_reported": manifest["layout"]["reading_order"] == reading_order,
+        "column_major_reading_order": ordered,
+        "footer_candidates": len(manifest["excluded"]) == expected_excluded,
+        "nonempty_crops": all((out / b["file"]).exists() and (out / b["file"]).stat().st_size > 100 for b in lines),
+    }
+    return {"case": f"layout_{kind}_{reading_order}", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "excluded_count": len(manifest["excluded"]),
+            "region_count": len(manifest["layout"]["regions"])}
+
+
+def run_custom_region_case(binary, work):
+    source, out = work / "layout_custom_regions.png", work / "out_layout_custom_regions"
+    make_layout_fixture(source, "custom")
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out),
+                           "--region", "500,80,990,800", "--region", "10,80,490,800"],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    ok = proc.returncode == 0 and (out / "manifest.json").exists()
+    checks = {"custom_regions_accepted": ok}
+    if ok:
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        centers = [(b["bbox_xyxy"][0] + b["bbox_xyxy"][2]) / 2 for b in manifest["lines"]]
+        checks = {
+            "custom_mode_reported": manifest["layout"]["mode"] == "custom",
+            "explicit_order_reported": manifest["layout"]["reading_order"] == "explicit",
+            "explicit_region_order": len(centers) == 8 and all(x > 500 for x in centers[:4]) and all(x < 500 for x in centers[4:]),
+            "region_labels_present": all("region" in b for b in manifest["lines"]),
+        }
+    return {"case": "layout_custom_regions", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2)}
+
+
+def run_single_layout_case(binary, work):
+    source, out = work / "layout_single.png", work / "out_layout_single"
+    make_layout_fixture(source, "columns")
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out), "--layout", "single"],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    ok = proc.returncode == 0 and (out / "manifest.json").exists()
+    checks = {"single_layout_accepted": ok}
+    if ok:
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        boxes = [b["bbox_xyxy"] for b in manifest["lines"]]
+        checks = {"single_mode_reported": manifest["layout"]["mode"] == "single",
+                  "rows_remain_full_width": len(boxes) == 4 and all(b[0] < 500 < b[2] for b in boxes)}
+    return {"case": "layout_single_override", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2)}
+
+
+def run_bad_custom_region_case(binary, work):
+    source = work / "layout_bad_custom_region.png"
+    make_layout_fixture(source, "columns")
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(work / "out_bad_region"),
+                           "--region", "0,0,1100,800"], text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    ok = proc.returncode == 1 and "outside the deskewed image bounds" in proc.stderr
+    return {"case": "layout_custom_region_out_of_bounds", "pass": ok,
+            "checks": {"out_of_bounds_region_rejected": ok}, "elapsed_ms": round(elapsed_ms, 2)}
 
 
 def main():
@@ -214,6 +367,13 @@ def main():
         results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
         results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
         results.extend(run_cli_cases(args.binary.resolve(), work))
+        results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
+                       run_layout_case(args.binary.resolve(), work, "columns"),
+                       run_layout_case(args.binary.resolve(), work, "columns", "rtl"),
+                       run_layout_case(args.binary.resolve(), work, "newspaper"),
+                       run_custom_region_case(args.binary.resolve(), work),
+                       run_single_layout_case(args.binary.resolve(), work),
+                       run_bad_custom_region_case(args.binary.resolve(), work)))
     else:
         with tempfile.TemporaryDirectory(prefix="lineforge-bench-") as tmp:
             work = Path(tmp)
@@ -221,6 +381,13 @@ def main():
             results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
             results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
             results.extend(run_cli_cases(args.binary.resolve(), work))
+            results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
+                           run_layout_case(args.binary.resolve(), work, "columns"),
+                           run_layout_case(args.binary.resolve(), work, "columns", "rtl"),
+                           run_layout_case(args.binary.resolve(), work, "newspaper"),
+                           run_custom_region_case(args.binary.resolve(), work),
+                           run_single_layout_case(args.binary.resolve(), work),
+                           run_bad_custom_region_case(args.binary.resolve(), work)))
     timings = [r["elapsed_ms"] for r in results]
     report = {
         "benchmark": "synthetic line-segmentation geometry",
