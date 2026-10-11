@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -350,7 +351,7 @@ class DispatcherIntegrationTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             fake_linecrop = root / "fake-linecrop"
             fake_linecrop.write_text(
-                "#!/usr/bin/env python3\n"
+                f"#!{sys.executable}\n"
                 "import argparse, json\n"
                 "from pathlib import Path\n"
                 "from PIL import Image, ImageDraw\n"
