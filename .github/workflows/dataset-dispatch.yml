@@ -1,0 +1,81 @@
+name: LineForge dataset dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_seed:
+        description: Private deterministic sampling seed for this approved run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lineforge-dataset-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: github.ref == 'refs/heads/main'
+    name: LineForge dataset dispatch (19 workers + live coordinator)
+    runs-on: [self-hosted, linux, x64, lineforge-dataset]
+    timeout-minutes: 360
+    env:
+      LINEFORGE_SOURCE_ROOT: ${{ vars.LINEFORGE_SOURCE_ROOT }}
+      LINEFORGE_OUTPUT_ROOT: ${{ vars.LINEFORGE_OUTPUT_ROOT }}
+      LINEFORGE_RUN_SEED: ${{ inputs.run_seed }}
+      LINEFORGE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out LineForge
+        uses: actions/checkout@v4
+
+      - name: Validate trusted runner staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$LINEFORGE_SOURCE_ROOT" || -z "$LINEFORGE_OUTPUT_ROOT" ]]; then
+            echo "Configure repository Actions variables LINEFORGE_SOURCE_ROOT and LINEFORGE_OUTPUT_ROOT on the dedicated runner."
+            exit 1
+          fi
+          [[ -d "$LINEFORGE_SOURCE_ROOT" ]]
+          [[ -f "$LINEFORGE_SOURCE_ROOT/manifest.json" ]]
+          mkdir -p "$LINEFORGE_OUTPUT_ROOT"
+          source_root="$(realpath "$LINEFORGE_SOURCE_ROOT")"
+          output_root="$(realpath "$LINEFORGE_OUTPUT_ROOT")"
+          repo_root="$(realpath "$GITHUB_WORKSPACE")"
+          case "$source_root/" in
+            "$repo_root/"*) echo "Source staging must be outside the checked-out repository."; exit 1 ;;
+          esac
+          case "$output_root/" in
+            "$repo_root/"*) echo "Dataset outputs must be outside the checked-out repository."; exit 1 ;;
+            "$source_root/"*) echo "Dataset outputs must not be inside the private source tree."; exit 1 ;;
+          esac
+          command -v cmake
+          command -v c++
+          command -v pdfinfo
+          command -v pdftoppm
+          python3 -c 'import PIL'
+
+      - name: Build and test LineForge
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
+      - name: Dispatch 19 workers and one live coordinator
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/lineforge_dataset.py dispatch \
+            --input-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
+            --source-root "$LINEFORGE_SOURCE_ROOT" \
+            --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
+            --run-seed "$LINEFORGE_RUN_SEED" \
+            --run-id "$LINEFORGE_RUN_ID" \
+            --linecrop "$GITHUB_WORKSPACE/build/linecrop" \
+            --target 100024 \
+            --dpi 300 \
+            --timeout-seconds 21600

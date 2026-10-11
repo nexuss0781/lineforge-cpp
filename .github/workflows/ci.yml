@@ -19,7 +19,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libjpeg-dev libpng-dev fonts-noto-core python3-venv
+          sudo apt-get install -y cmake g++ libjpeg-dev libpng-dev fonts-noto-core poppler-utils python3-venv
       - name: Install benchmark dependency
         run: |
           python3 -m venv .venv

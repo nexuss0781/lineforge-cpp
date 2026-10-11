@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Local-file NTF adapter for preparing a provenance-rich LineForge crop dataset.
+"""LineForge-native local pipeline for a provenance-rich line-crop dataset.
 
-This module deliberately has no Telegram, Hugging Face, cloud-storage, or training
-client. Its SQLite quota ledger is safe only when all workers share one filesystem.
-GitHub Actions jobs do not share that filesystem; hosted dispatch requires a
-separately configured shared atomic control store and approved PDF source adapter.
+The pipeline stages local approved PDFs, dispatches 19 colocated worker processes,
+and runs one live coordinator against a shared SQLite quota ledger. It deliberately
+has no Telegram, cloud-storage, training, or active publication client.
 """
 from __future__ import annotations
 
@@ -14,6 +13,8 @@ import json
 import math
 import os
 import random
+import re
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -31,6 +32,14 @@ WORKER_COUNT = 19
 DEFAULT_TARGET = 100_024
 MIN_PAGE = 10  # one-based PDF page number
 ENGINE_VERSION = "lineforge-1.0.1"
+
+
+def require_hf_token() -> str:
+    """Return the configured HF_TOKEN for a future explicitly approved publisher."""
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Hugging Face publication requires the HF_TOKEN environment variable")
+    return token
 
 
 def canonical_json(value: Any) -> bytes:
@@ -73,7 +82,12 @@ def load_json(path: Path) -> Any:
         raise ValueError(f"cannot read valid JSON from {path}: {exc}") from exc
 
 
-def validate_source_manifest(document: Any, base_dir: Path, verify_files: bool = True) -> list[dict[str, Any]]:
+def validate_source_manifest(
+    document: Any,
+    base_dir: Path,
+    verify_files: bool = True,
+    allowed_root: Path | None = None,
+) -> list[dict[str, Any]]:
     """Validate a private local-file manifest; reject unknown rights and duplicate PDFs."""
     if not isinstance(document, dict) or document.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("input manifest must be an object with schema_version=1")
@@ -88,6 +102,7 @@ def validate_source_manifest(document: Any, base_dir: Path, verify_files: bool =
     seen_ids: set[str] = set()
     seen_hashes: set[str] = set()
     accepted: list[dict[str, Any]] = []
+    resolved_root = allowed_root.resolve() if allowed_root is not None else None
     for index, raw in enumerate(files):
         where = f"files[{index}]"
         if not isinstance(raw, dict):
@@ -120,7 +135,13 @@ def validate_source_manifest(document: Any, base_dir: Path, verify_files: bool =
 
         resolved = Path(local_path)
         if not resolved.is_absolute():
-            resolved = (base_dir / resolved).resolve()
+            resolved = base_dir / resolved
+        resolved = resolved.resolve()
+        if resolved_root is not None:
+            try:
+                resolved.relative_to(resolved_root)
+            except ValueError as exc:
+                raise ValueError(f"{where}.path resolves outside the approved source root") from exc
         entry = dict(raw)
         entry["path"] = str(resolved)
         if page_count < MIN_PAGE:
@@ -146,7 +167,7 @@ def validate_source_manifest(document: Any, base_dir: Path, verify_files: bool =
 def assign_pdf_shards(files: Iterable[dict[str, Any]], shard_count: int = WORKER_COUNT) -> list[list[dict[str, Any]]]:
     """Balance whole PDFs by page count with a stable largest-processing-first rule."""
     if shard_count != WORKER_COUNT:
-        raise ValueError("NTF adapter requires exactly 19 worker shards")
+        raise ValueError("LineForge dataset pipeline requires exactly 19 worker shards")
     entries = list(files)
     if len({item["pdf_sha256"] for item in entries}) != len(entries):
         raise ValueError("duplicate PDF content would be assigned more than once")
@@ -256,10 +277,15 @@ class QuotaLedger:
             connection.execute("""CREATE TABLE IF NOT EXISTS images (
                 sequence INTEGER PRIMARY KEY, image_sha256 TEXT NOT NULL UNIQUE,
                 provenance_key TEXT NOT NULL UNIQUE, source_pdf_sha256 TEXT NOT NULL,
-                page_number INTEGER NOT NULL, line_index INTEGER NOT NULL,
+                source_pdf_id TEXT NOT NULL, page_number INTEGER NOT NULL, line_index INTEGER NOT NULL,
                 shard_id INTEGER NOT NULL, engine_version TEXT NOT NULL,
-                source_license TEXT NOT NULL,
+                source_license TEXT NOT NULL, rights_evidence_ref TEXT NOT NULL,
                 relative_path TEXT NOT NULL)""")
+            image_columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
+            if "source_pdf_id" not in image_columns:
+                connection.execute("ALTER TABLE images ADD COLUMN source_pdf_id TEXT NOT NULL DEFAULT ''")
+            if "rights_evidence_ref" not in image_columns:
+                connection.execute("ALTER TABLE images ADD COLUMN rights_evidence_ref TEXT NOT NULL DEFAULT ''")
             stored = connection.execute("SELECT target, run_id, manifest_sha256 FROM metadata WHERE id=1").fetchone()
             if stored is None:
                 connection.execute("INSERT INTO metadata(id,target,run_id,manifest_sha256) VALUES(1,?,?,?)",
@@ -288,7 +314,10 @@ class QuotaLedger:
             return int(connection.execute("SELECT COUNT(*) FROM images WHERE shard_id=?", (shard_id,)).fetchone()[0])
 
     def accept(self, image_path: Path, record: dict[str, Any]) -> str:
-        required = ("source_pdf_sha256", "page_number", "line_index", "shard_id", "source_license")
+        required = (
+            "source_pdf_sha256", "source_pdf_id", "page_number", "line_index",
+            "shard_id", "source_license", "rights_evidence_ref",
+        )
         if any(key not in record for key in required):
             raise ValueError("image provenance is incomplete")
         if type(record["page_number"]) is not int or record["page_number"] < MIN_PAGE:
@@ -302,6 +331,10 @@ class QuotaLedger:
             raise ValueError("source_pdf_sha256 must be a SHA-256 digest")
         if not isinstance(record["source_license"], str) or not record["source_license"].strip():
             raise ValueError("source_license must be a non-empty rights declaration")
+        if not isinstance(record["source_pdf_id"], str) or not record["source_pdf_id"].strip():
+            raise ValueError("source_pdf_id must be a non-empty provenance identifier")
+        if not isinstance(record["rights_evidence_ref"], str) or not record["rights_evidence_ref"].strip():
+            raise ValueError("rights_evidence_ref must identify the private rights evidence")
         image_bytes = image_path.read_bytes()
         image_hash = sha256_bytes(image_bytes)
         provenance_key = f"{source_hash}:{record['page_number']}:{record['line_index']}"
@@ -328,10 +361,10 @@ class QuotaLedger:
                 atomic_write(destination, image_bytes)
             try:
                 connection.execute(
-                    "INSERT INTO images(sequence,image_sha256,provenance_key,source_pdf_sha256,page_number,line_index,shard_id,engine_version,source_license,relative_path) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (current + 1, image_hash, provenance_key, source_hash, record["page_number"],
+                    "INSERT INTO images(sequence,image_sha256,provenance_key,source_pdf_sha256,source_pdf_id,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (current + 1, image_hash, provenance_key, source_hash, record["source_pdf_id"], record["page_number"],
                      record["line_index"], record["shard_id"], record.get("engine_version", ENGINE_VERSION),
-                     record["source_license"],
+                     record["source_license"], record["rights_evidence_ref"],
                      str(relative_path.as_posix())),
                 )
                 connection.commit()
@@ -343,9 +376,10 @@ class QuotaLedger:
     def records(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT sequence,image_sha256,source_pdf_sha256,page_number,line_index,shard_id,engine_version,source_license,relative_path FROM images ORDER BY sequence"
+                "SELECT sequence,image_sha256,source_pdf_sha256,source_pdf_id,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path FROM images ORDER BY sequence"
             ).fetchall()
-        return [dict(zip(("sequence", "image_sha256", "source_pdf_sha256", "page_number", "line_index", "shard_id", "engine_version", "source_license", "relative_path"), row)) for row in rows]
+        fields = ("sequence", "image_sha256", "source_pdf_sha256", "source_pdf_id", "page_number", "line_index", "shard_id", "engine_version", "source_license", "rights_evidence_ref", "relative_path")
+        return [dict(zip(fields, row)) for row in rows]
 
 
 def load_shard_identity(shards_dir: Path) -> tuple[str, str]:
@@ -380,6 +414,8 @@ def monitor_local_workers(ledger: QuotaLedger, results_dir: Path, poll_seconds: 
             raise ValueError("shared quota ledger exceeded its configured target")
         result_files = sorted(results_dir.glob("worker-*.json")) if results_dir.exists() else []
         print(f"live unique images: {count}/{ledger.target}; worker results: {len(result_files)}/{WORKER_COUNT}", flush=True)
+        if len(result_files) > WORKER_COUNT:
+            raise ValueError("coordinator found more than 19 worker result files")
         if count == ledger.target and len(result_files) == WORKER_COUNT:
             return {"status": "target_reached", "image_count": count, "worker_results": len(result_files)}
         if len(result_files) == WORKER_COUNT and count < ledger.target:
@@ -390,11 +426,23 @@ def monitor_local_workers(ledger: QuotaLedger, results_dir: Path, poll_seconds: 
         time.sleep(min(poll_seconds, remaining))
 
 
-def prepare_shard_manifests(input_path: Path, output_dir: Path, run_seed: str, run_id: str) -> dict[str, Any]:
+def prepare_shard_manifests(
+    input_path: Path,
+    output_dir: Path,
+    run_seed: str,
+    run_id: str,
+    source_root: Path | None = None,
+) -> dict[str, Any]:
     if not run_seed or not run_id:
         raise ValueError("run_seed and run_id must be non-empty")
+    if source_root is not None:
+        source_root = source_root.resolve()
+        try:
+            input_path.resolve().relative_to(source_root)
+        except ValueError as exc:
+            raise ValueError("input manifest resolves outside the approved source root") from exc
     document = load_json(input_path)
-    entries = validate_source_manifest(document, input_path.parent, verify_files=True)
+    entries = validate_source_manifest(document, input_path.parent, verify_files=True, allowed_root=source_root)
     if not entries:
         raise ValueError("no Status=true PDFs with at least 10 pages are eligible")
     input_digest = sha256_file(input_path)
@@ -429,7 +477,10 @@ def prepare_shard_manifests(input_path: Path, output_dir: Path, run_seed: str, r
 
 
 def _pdf_page_count(pdf_path: Path) -> int:
-    proc = subprocess.run(["pdfinfo", str(pdf_path)], text=True, capture_output=True, check=False)
+    try:
+        proc = subprocess.run(["pdfinfo", str(pdf_path)], text=True, capture_output=True, check=False, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("PDF page-count inspection timed out") from exc
     if proc.returncode != 0:
         raise RuntimeError("pdfinfo could not inspect a staged PDF")
     for line in proc.stdout.splitlines():
@@ -456,8 +507,11 @@ def process_shard(
     run_id = shard_doc.get("run_id")
     manifest_digest = shard_doc.get("source_manifest_sha256")
     files = shard_doc.get("files")
-    if not isinstance(run_id, str) or not isinstance(manifest_digest, str) or not isinstance(files, list):
+    if not isinstance(run_id, str) or not isinstance(manifest_digest, str) or len(manifest_digest) != 64 or not isinstance(files, list):
         raise ValueError("shard manifest lacks run/input identity or files")
+    run_seed = shard_doc.get("run_seed")
+    if not isinstance(run_seed, str) or not run_seed.strip():
+        raise ValueError("shard manifest lacks its deterministic run seed")
     if not linecrop_binary.is_file() or not os.access(linecrop_binary, os.X_OK):
         raise FileNotFoundError(f"linecrop executable is unavailable: {linecrop_binary}")
     ledger = QuotaLedger(ledger_path, output_dir, target, run_id, manifest_digest)
@@ -474,6 +528,17 @@ def process_shard(
             stopped_at_quota = True
             break
         pdf_path = Path(pdf["path"])
+        rights = pdf.get("redistribution")
+        if (
+            not isinstance(pdf.get("pdf_id"), str)
+            or not isinstance(rights, dict)
+            or rights.get("allowed") is not True
+            or not isinstance(rights.get("license"), str)
+            or not rights["license"].strip()
+            or not isinstance(rights.get("evidence_ref"), str)
+            or not rights["evidence_ref"].strip()
+        ):
+            raise ValueError("shard source lacks explicit redistribution rights provenance")
         if not pdf_path.is_file() or sha256_file(pdf_path) != pdf["pdf_sha256"]:
             raise ValueError("staged PDF is missing or its source checksum changed")
         actual_pages = _pdf_page_count(pdf_path)
@@ -481,7 +546,7 @@ def process_shard(
             raise ValueError("staged PDF page count differs from the immutable manifest")
         page_count_checked.add(pdf["pdf_sha256"])
         pdfs_processed += 1
-        for page_number in middle_page_order(pdf["page_count"], shard_doc["run_seed"], pdf["pdf_sha256"]):
+        for page_number in middle_page_order(pdf["page_count"], run_seed, pdf["pdf_sha256"]):
             if ledger.count() >= target:
                 stopped_at_quota = True
                 break
@@ -489,17 +554,23 @@ def process_shard(
             page_work.mkdir(parents=True, exist_ok=True)
             page_base = page_work / "source-page"
             rendered_path = Path(str(page_base) + ".png")
-            render = subprocess.run(
-                ["pdftoppm", "-f", str(page_number), "-l", str(page_number), "-singlefile", "-png", "-r", str(dpi), str(pdf_path), str(page_base)],
-                text=True, capture_output=True, check=False,
-            )
+            try:
+                render = subprocess.run(
+                    ["pdftoppm", "-f", str(page_number), "-l", str(page_number), "-singlefile", "-png", "-r", str(dpi), str(pdf_path), str(page_base)],
+                    text=True, capture_output=True, check=False, timeout=600,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"page render timed out for page {page_number}") from exc
             if render.returncode != 0 or not rendered_path.is_file():
                 raise RuntimeError(f"page render failed for page {page_number}; source content was not accepted")
             crop_dir = page_work / "crops"
-            proc = subprocess.run(
-                [str(linecrop_binary), "--input", str(rendered_path), "--output", str(crop_dir), "--layout", "auto"],
-                text=True, capture_output=True, check=False,
-            )
+            try:
+                proc = subprocess.run(
+                    [str(linecrop_binary), "--input", str(rendered_path), "--output", str(crop_dir), "--layout", "auto"],
+                    text=True, capture_output=True, check=False, timeout=600,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"LineForge timed out on source page {page_number}") from exc
             page_manifest_path = crop_dir / "manifest.json"
             if proc.returncode not in (0, 2) or not page_manifest_path.is_file():
                 raise RuntimeError(f"LineForge failed on source page {page_number}; source content was not accepted")
@@ -515,17 +586,23 @@ def process_shard(
                 if not isinstance(line, dict) or not isinstance(line.get("file"), str):
                     raise ValueError("LineForge emitted a malformed line entry")
                 crop_path = crop_dir / line["file"]
+                try:
+                    crop_path.resolve().relative_to(crop_dir.resolve())
+                except ValueError as exc:
+                    raise ValueError("LineForge line path escapes the page crop directory") from exc
                 accepted, reason = crop_acceptance_reason(crop_path, line)
                 if not accepted:
                     skipped_review += 1
                     continue
                 result = ledger.accept(crop_path, {
                     "source_pdf_sha256": pdf["pdf_sha256"],
+                    "source_pdf_id": pdf["pdf_id"],
                     "page_number": page_number,
                     "line_index": line_index,
                     "shard_id": shard_id,
                     "engine_version": page_manifest.get("version", ENGINE_VERSION),
                     "source_license": pdf["redistribution"]["license"],
+                    "rights_evidence_ref": pdf["redistribution"]["evidence_ref"],
                 })
                 if result.startswith("duplicate"):
                     skipped_duplicate += 1
@@ -540,7 +617,7 @@ def process_shard(
     worker_result = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
-        "run_seed": shard_doc["run_seed"],
+        "run_seed": run_seed,
         "shard_id": shard_id,
         "worker_count": WORKER_COUNT,
         "source_manifest_sha256": manifest_digest,
@@ -558,6 +635,150 @@ def process_shard(
     result_path = output_dir / "workers" / f"worker-{shard_id:02d}.json"
     atomic_write(result_path, json.dumps(worker_result, indent=2, sort_keys=True).encode("utf-8") + b"\n")
     return result_path
+
+
+def _terminate_processes(processes: Iterable[subprocess.Popen[Any]]) -> None:
+    live = [process for process in processes if process.poll() is None]
+    for process in live:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+    for process in live:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def dispatch_local_run(
+    input_manifest: Path,
+    source_root: Path,
+    run_dir: Path,
+    run_seed: str,
+    run_id: str,
+    linecrop_binary: Path,
+    target: int = DEFAULT_TARGET,
+    dpi: int = 300,
+    poll_seconds: int = 5,
+    timeout_seconds: int = 21_600,
+) -> dict[str, Any]:
+    """Run 19 local workers and one local coordinator against one shared ledger."""
+    if not run_seed.strip():
+        raise ValueError("run_seed must be non-empty")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+        raise ValueError("run_id must use 1-128 letters, digits, dots, underscores, or hyphens")
+    if target < 1 or dpi < 72 or dpi > 600 or poll_seconds < 1 or timeout_seconds < 1:
+        raise ValueError("target and poll/timeout values must be positive; DPI must be between 72 and 600")
+    source_root = source_root.resolve()
+    input_manifest = input_manifest.resolve()
+    run_dir = run_dir.resolve()
+    linecrop_binary = linecrop_binary.resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"approved source root is unavailable: {source_root}")
+    try:
+        input_manifest.relative_to(source_root)
+    except ValueError as exc:
+        raise ValueError("input manifest resolves outside the approved source root") from exc
+    if run_dir == source_root or run_dir.is_relative_to(source_root) or source_root.is_relative_to(run_dir):
+        raise ValueError("run directory and private source root must be separate trees")
+    if not linecrop_binary.is_file() or not os.access(linecrop_binary, os.X_OK):
+        raise FileNotFoundError(f"LineForge executable is unavailable: {linecrop_binary}")
+    for utility in ("pdfinfo", "pdftoppm"):
+        if shutil.which(utility) is None:
+            raise FileNotFoundError(f"required PDF utility is unavailable: {utility}")
+    if run_dir.exists():
+        raise FileExistsError(f"refusing to reuse an existing run directory: {run_dir}")
+
+    run_dir.mkdir(parents=True)
+    shards_dir = run_dir / "shards"
+    work_dir = run_dir / "work"
+    output_dir = run_dir / "dataset"
+    ledger_path = run_dir / "quota.sqlite"
+    results_dir = output_dir / "workers"
+    summary = prepare_shard_manifests(input_manifest, shards_dir, run_seed, run_id, source_root)
+    ledger = QuotaLedger(ledger_path, output_dir, target, run_id, summary["source_manifest_sha256"])
+    script_path = Path(__file__).resolve()
+    common = [
+        "--linecrop", str(linecrop_binary),
+        "--work-dir", str(work_dir),
+        "--output-dir", str(output_dir),
+        "--ledger", str(ledger_path),
+        "--target", str(target),
+        "--dpi", str(dpi),
+    ]
+    monitor_command = [
+        sys.executable, str(script_path), "monitor",
+        "--shards-dir", str(shards_dir),
+        "--results-dir", str(results_dir),
+        "--ledger", str(ledger_path),
+        "--output-dir", str(output_dir),
+        "--target", str(target),
+        "--poll-seconds", str(poll_seconds),
+        "--timeout-seconds", str(timeout_seconds),
+    ]
+    coordinator: subprocess.Popen[Any] | None = None
+    workers: list[subprocess.Popen[Any]] = []
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        print(f"LineForge dispatch: starting {WORKER_COUNT} workers and 1 live coordinator", flush=True)
+        coordinator = subprocess.Popen(monitor_command, start_new_session=(os.name == "posix"))
+        for shard_id in range(WORKER_COUNT):
+            command = [
+                sys.executable, str(script_path), "worker",
+                "--shard-manifest", str(shards_dir / f"shard-{shard_id:02d}.json"),
+                *common,
+            ]
+            workers.append(subprocess.Popen(command, start_new_session=(os.name == "posix")))
+
+        while True:
+            failed = [(index, process.returncode) for index, process in enumerate(workers) if process.poll() not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"worker process failure(s): {failed}")
+            if coordinator.poll() not in (None, 0):
+                raise RuntimeError(f"live coordinator exited with status {coordinator.returncode}")
+            if all(process.poll() == 0 for process in workers):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"LineForge dispatch timed out after {timeout_seconds} seconds")
+            time.sleep(min(0.25, remaining))
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("LineForge dispatch timed out while finalizing the live coordinator")
+        coordinator_status = coordinator.wait(timeout=remaining)
+        if coordinator_status != 0:
+            raise RuntimeError(f"live coordinator exited with status {coordinator_status}")
+
+        final_path = run_dir / "dataset-manifest.json"
+        final = reduce_worker_results(
+            results_dir, ledger, run_id, summary["source_manifest_sha256"], target, final_path
+        )
+        dispatch_summary = {
+            "run_id": run_id,
+            "worker_count": WORKER_COUNT,
+            "coordinator_count": 1,
+            "source_manifest_sha256": summary["source_manifest_sha256"],
+            "target_unique_images": target,
+            "image_count": final["image_count"],
+            "publishable": False,
+            "run_dir": str(run_dir),
+            "dataset_manifest": str(final_path),
+            "image_directory": str(output_dir / "images"),
+        }
+        atomic_write(run_dir / "dispatch-summary.json", json.dumps(dispatch_summary, indent=2, sort_keys=True).encode("utf-8") + b"\n")
+        return dispatch_summary
+    except BaseException:
+        if coordinator is not None:
+            _terminate_processes([coordinator, *workers])
+        else:
+            _terminate_processes(workers)
+        raise
 
 
 def reduce_worker_results(results_dir: Path, ledger: QuotaLedger, run_id: str, manifest_sha256: str, target: int, output_path: Path) -> dict[str, Any]:
@@ -611,6 +832,8 @@ def reduce_worker_results(results_dir: Path, ledger: QuotaLedger, run_id: str, m
     for row in records:
         if row["page_number"] < MIN_PAGE:
             raise ValueError("final output contains a crop from before page 10")
+        if not row["source_pdf_id"] or not row["source_license"] or not row["rights_evidence_ref"]:
+            raise ValueError("final output is missing source or redistribution-rights provenance")
         image_path = ledger.output_dir / row["relative_path"]
         if not image_path.is_file() or sha256_file(image_path) != row["image_sha256"]:
             raise ValueError("final image is missing or its content checksum differs")
@@ -634,7 +857,7 @@ def reduce_worker_results(results_dir: Path, ledger: QuotaLedger, run_id: str, m
 
 
 def _cmd_prepare(args: argparse.Namespace) -> int:
-    summary = prepare_shard_manifests(args.input_manifest, args.output_dir, args.run_seed, args.run_id)
+    summary = prepare_shard_manifests(args.input_manifest, args.output_dir, args.run_seed, args.run_id, args.source_root)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
@@ -661,16 +884,34 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    result = dispatch_local_run(
+        args.input_manifest,
+        args.source_root,
+        args.run_dir,
+        args.run_seed,
+        args.run_id,
+        args.linecrop,
+        args.target,
+        args.dpi,
+        args.poll_seconds,
+        args.timeout_seconds,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="LineForge local dataset preparation, dispatch, monitoring, and reduction")
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare = subparsers.add_parser("prepare", help="validate a staged local PDF manifest and make 19 disjoint shards")
     prepare.add_argument("--input-manifest", type=Path, required=True)
     prepare.add_argument("--output-dir", type=Path, required=True)
+    prepare.add_argument("--source-root", type=Path)
     prepare.add_argument("--run-seed", required=True)
     prepare.add_argument("--run-id", required=True)
     prepare.set_defaults(func=_cmd_prepare)
-    worker = subparsers.add_parser("worker", help="process one local shard using a shared local SQLite quota ledger")
+    worker = subparsers.add_parser("worker", help="process one LineForge shard using the shared local quota ledger")
     worker.add_argument("--shard-manifest", type=Path, required=True)
     worker.add_argument("--linecrop", type=Path, required=True)
     worker.add_argument("--work-dir", type=Path, required=True)
@@ -679,7 +920,7 @@ def main() -> int:
     worker.add_argument("--target", type=int, default=DEFAULT_TARGET)
     worker.add_argument("--dpi", type=int, default=300)
     worker.set_defaults(func=_cmd_worker)
-    reduce = subparsers.add_parser("reduce", help="validate all 19 local worker results and emit exact-count provenance")
+    reduce = subparsers.add_parser("reduce", help="validate all 19 worker results and emit exact-count provenance")
     reduce.add_argument("--shards-dir", type=Path, required=True)
     reduce.add_argument("--results-dir", type=Path, required=True)
     reduce.add_argument("--ledger", type=Path, required=True)
@@ -687,7 +928,7 @@ def main() -> int:
     reduce.add_argument("--target", type=int, default=DEFAULT_TARGET)
     reduce.add_argument("--output", type=Path, required=True)
     reduce.set_defaults(func=_cmd_reduce)
-    monitor = subparsers.add_parser("monitor", help="monitor local worker counts using the shared SQLite quota ledger")
+    monitor = subparsers.add_parser("monitor", help="live-monitor workers using the shared SQLite quota ledger")
     monitor.add_argument("--shards-dir", type=Path, required=True)
     monitor.add_argument("--results-dir", type=Path, required=True)
     monitor.add_argument("--ledger", type=Path, required=True)
@@ -696,11 +937,23 @@ def main() -> int:
     monitor.add_argument("--poll-seconds", type=int, default=5)
     monitor.add_argument("--timeout-seconds", type=int, default=21_600)
     monitor.set_defaults(func=_cmd_monitor)
+    dispatch = subparsers.add_parser("dispatch", help="start 19 LineForge workers and 1 live coordinator on one trusted host")
+    dispatch.add_argument("--input-manifest", type=Path, required=True)
+    dispatch.add_argument("--source-root", type=Path, required=True)
+    dispatch.add_argument("--run-dir", type=Path, required=True)
+    dispatch.add_argument("--run-seed", required=True)
+    dispatch.add_argument("--run-id", required=True)
+    dispatch.add_argument("--linecrop", type=Path, required=True)
+    dispatch.add_argument("--target", type=int, default=DEFAULT_TARGET)
+    dispatch.add_argument("--dpi", type=int, default=300)
+    dispatch.add_argument("--poll-seconds", type=int, default=5)
+    dispatch.add_argument("--timeout-seconds", type=int, default=21_600)
+    dispatch.set_defaults(func=_cmd_dispatch)
     args = parser.parse_args()
     try:
         return args.func(args)
     except Exception as exc:
-        print(f"ntf-lineforge: {exc}", file=sys.stderr)
+        print(f"lineforge-dataset: {exc}", file=sys.stderr)
         return 1
 
 

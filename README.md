@@ -79,9 +79,9 @@ The workbook/answer-row and handwriting-like tests are synthetic. No real handwr
 
 Deskew is limited to mild skew (±5°); perspective correction and arbitrary page dewarping are out of scope. Adaptive thresholding can compensate for uneven illumination but cannot recover missing or blurred source detail. Large images are limited to 100 megapixels to prevent accidental memory exhaustion. Inspect `review_required` crops and every `excluded` manifest entry before bulk processing.
 
-## NTF dataset preparation (local preflight)
+## LineForge dataset preparation and dispatch
 
-The NTF adapter for staged local PDFs is documented in [`docs/ntf-lineforge-dataset.md`](docs/ntf-lineforge-dataset.md). It prepares line-crop images only; it does not run OCR or train Tesseract. Hosted Actions dispatch and Hugging Face publication remain gated on approved source access, redistribution rights, and a shared cross-job quota store.
+The LineForge-owned dataset pipeline is documented in [`docs/dataset-pipeline.md`](docs/dataset-pipeline.md). It stages local PDFs, dispatches 19 LineForge worker processes plus one live coordinator on a single trusted runner, enforces an exact shared quota, and collects per-image provenance. It does not run OCR or training. The manual GitHub Action requires a configured dedicated runner and an approved local source manifest; it never downloads from Telegram or publishes to Hugging Face.
 
 ## License
 

@@ -24,10 +24,10 @@ if(BUILD_TESTING)
   add_test(NAME real_page_eval_unit
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_real_page_eval.py)
-  add_test(NAME ntf_lineforge_dataset_unit
+  add_test(NAME lineforge_dataset_unit
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
-            -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_ntf_lineforge_dataset.py)
-  set_tests_properties(ntf_lineforge_dataset_unit PROPERTIES
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_lineforge_dataset.py)
+  set_tests_properties(lineforge_dataset_unit PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60)
   add_test(NAME batch_output_regression

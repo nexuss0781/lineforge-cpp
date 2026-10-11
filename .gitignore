@@ -4,5 +4,8 @@ cmake-build-*/
 .venv/
 benchmark-output/
 line-crops/
+private-staging/
+dataset-runs/
+manifest.json
 __pycache__/
 *.pyc
