@@ -772,10 +772,82 @@ static void mark_likely_page_numbers(std::vector<Band>& bands, int w, int h, boo
     }
 }
 
-static void mark_likely_nontext_fragments(std::vector<Band>& bands, int w, int h) {
+static bool bottom_frame_scan_artifact(const Band& band,
+                                      const std::vector<uint8_t>& mask,
+                                      int width, int height, int typical_height,
+                                      bool debug = false) {
+    const int region_left = std::clamp(band.region_x0 >= 0 ? band.region_x0 : 0, 0, width);
+    const int region_right = std::clamp(band.region_x1 > region_left ? band.region_x1 : width,
+                                        region_left, width);
+    const int region_width = region_right - region_left;
+    const int band_width = band.x1 - band.x0 + 1;
+    if (region_width < 8 || band_width < region_width * 0.60) return false;
+
+    // Scale the probe with the document's typical line height. A sustained
+    // horizontal run along the image frame is stronger evidence than proximity
+    // alone, so genuinely clipped text remains available for review.
+    const int edge_depth = std::clamp(static_cast<int>(std::lround(typical_height * 1.25)),
+                                      3, std::max(3, height / 10));
+    const bool near_frame = band.y1 >= height - edge_depth - 1;
+    if (!near_frame) return false;
+    const int row_coverage = std::max(8, static_cast<int>(std::lround(region_width * 0.30)));
+    int edge_run = 0, longest_edge_run = 0;
+    for (int y = height - 1; y >= std::max(0, height - edge_depth); --y) {
+        const size_t row = static_cast<size_t>(y) * width;
+        int ink = 0;
+        for (int x = region_left; x < region_right; ++x)
+            ink += mask[row + static_cast<size_t>(x)] != 0;
+        if (ink >= row_coverage) {
+            longest_edge_run = std::max(longest_edge_run, ++edge_run);
+        } else {
+            edge_run = 0;
+        }
+    }
+    uint64_t candidate_ink = 0, edge_ink = 0;
+    const int x0 = std::clamp(band.x0, region_left, region_right);
+    const int x1 = std::clamp(band.x1 + 1, x0, region_right);
+    for (int y = std::max(0, band.y0); y <= std::min(height - 1, band.y1); ++y) {
+        const size_t row = static_cast<size_t>(y) * width;
+        int row_ink = 0;
+        for (int x = x0; x < x1; ++x)
+            row_ink += mask[row + static_cast<size_t>(x)] != 0;
+        candidate_ink += static_cast<uint64_t>(row_ink);
+        if (y >= height - edge_depth) edge_ink += static_cast<uint64_t>(row_ink);
+    }
+    const bool artifact = band_width >= region_width * 0.60 && longest_edge_run >= 2 &&
+                          candidate_ink >= 8 && edge_ink * 2 >= candidate_ink;
+    if (debug)
+        std::cerr << "debug: bottom_frame_check band=[" << band.x0 << "," << band.y0 << ","
+                  << band.x1 + 1 << "," << band.y1 + 1 << "] region_x=[" << region_left << ","
+                  << region_right << ") typical_height=" << typical_height
+                  << " edge_depth=" << edge_depth << " longest_edge_run=" << longest_edge_run
+                  << " candidate_ink=" << candidate_ink << " edge_ink=" << edge_ink
+                  << " artifact=" << (artifact ? "true" : "false") << "\n";
+    return artifact;
+}
+
+static void mark_likely_nontext_fragments(std::vector<Band>& bands, int w, int h,
+                                          const std::vector<uint8_t>& mask,
+                                          bool debug = false) {
+    std::vector<int> height_samples;
+    for (const auto& band : bands) {
+        const int band_height = band.y1 - band.y0 + 1;
+        if (!band.non_text_fragment && band_height >= 4 && band_height <= h * 0.08)
+            height_samples.push_back(band_height);
+    }
+    int typical_height = 12;
+    if (!height_samples.empty()) {
+        auto middle = height_samples.begin() + height_samples.size() / 2;
+        std::nth_element(height_samples.begin(), middle, height_samples.end());
+        typical_height = *middle;
+    }
     for (auto& b : bands) {
         const int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
         if (bw <= 0 || bh <= 0) continue;
+        if (bottom_frame_scan_artifact(b, mask, w, h, typical_height, debug)) {
+            b.non_text_fragment = true;
+            continue;
+        }
         // Leave compact footer-like candidates to the existing page-number review rule.
         const double center = (b.x0 + b.x1) / 2.0;
         const bool footer_lane = std::min({std::abs(center - w * 0.25), std::abs(center - w * 0.50),
@@ -1524,7 +1596,7 @@ int main(int argc, char** argv) {
             bands.insert(bands.end(), local_bands.begin(), local_bands.end());
         }
         if (opt.custom_regions.empty() && opt.layout == "auto")
-            mark_likely_nontext_fragments(bands, processed.width, processed.height);
+            mark_likely_nontext_fragments(bands, processed.width, processed.height, mask, opt.debug);
         merge_short_line_fragments(bands, processed.height);
         std::fill(lines_per_region.begin(), lines_per_region.end(), 0);
         for (const auto& b : bands)

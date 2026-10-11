@@ -390,6 +390,92 @@ def run_edge_clipping_case(binary, work):
             "checks": checks, "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
 
 
+def make_bottom_frame_fixture(path):
+    width, height = 1200, 1100
+    im = Image.new("L", (width, height), 255)
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+    except OSError:
+        font = ImageFont.load_default()
+    for i, y in enumerate((150, 280, 410, 540)):
+        draw_fixture_line(draw, font, 70, 520, y, i)
+        draw_fixture_line(draw, font, 680, 1130, y, i + 1)
+    draw.line((600, 15, 600, height - 15), fill=0, width=12)
+    draw.text((295, 930), "7", font=font, fill=12)
+    draw.text((895, 930), "8", font=font, fill=12)
+    # Model a partial scanner/page-edge strip on one leaf, not a full-width
+    # synthetic rule; its dimensions scale with the page and local text height.
+    draw.rectangle((round(width * 0.68), round(height * 0.972), width - 1, height - 1), fill=0)
+    im.save(path, "PNG")
+
+
+def run_bottom_frame_scan_case(binary, work):
+    source, out = work / "bottom_frame_scan.png", work / "out_bottom_frame_scan"
+    make_bottom_frame_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0 or not (out / "manifest.json").exists():
+        return {"case": "bottom_frame_scan_edge", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    regions = manifest["layout"]["regions"]
+    height = manifest["image_size"]["height"]
+    bottom_artifact_excluded = any(
+        item["bbox_xyxy"][3] >= height * 0.95 and item["reason"] == "likely_non_text_fragment"
+        for item in manifest["excluded"]
+    )
+    body_lines = [line for line in lines if line["bbox_xyxy"][1] < height * 0.70]
+    footer_lines = [line for line in lines if height * 0.80 <= line["bbox_xyxy"][1] < height * 0.90]
+    min_gap = max(8, manifest["image_size"]["width"] // 200)
+    def crop_stays_on_its_gutter_side(line):
+        region = regions[line["region"] - 1]["bbox_xyxy"]
+        crop = line["source_crop_bbox_xyxy"]
+        left_neighbors, right_neighbors = [], []
+        for other_record in regions:
+            other = other_record["bbox_xyxy"]
+            if other == region:
+                continue
+            vertical_overlap = min(region[3], other[3]) - max(region[1], other[1])
+            smaller_height = min(region[3] - region[1], other[3] - other[1])
+            if vertical_overlap <= 0 or vertical_overlap * 2 < smaller_height:
+                continue
+            if other[2] <= region[0] and region[0] - other[2] >= min_gap:
+                left_neighbors.append(other)
+            if region[2] <= other[0] and other[0] - region[2] >= min_gap:
+                right_neighbors.append(other)
+        if left_neighbors:
+            left = max(left_neighbors, key=lambda item: item[2])
+            divider = left[2] + (region[0] - left[2]) // 2
+            if crop[0] < divider:
+                return False
+        if right_neighbors:
+            right = min(right_neighbors, key=lambda item: item[0])
+            divider = region[2] + (right[0] - region[2]) // 2
+            if crop[2] > divider:
+                return False
+        return True
+
+    crops_respect_gutter_midpoints = all(crop_stays_on_its_gutter_side(line) for line in lines)
+    checks = {
+        "eight_text_rows_retained": len(body_lines) == 8,
+        "footer_row_remains_separate_from_bottom_bar": bool(footer_lines),
+        "partial_bottom_frame_bar_excluded": bottom_artifact_excluded,
+        "padded_crops_stay_on_their_side_of_gutter_midpoints": crops_respect_gutter_midpoints,
+        "no_retained_crop_reaches_the_bottom_frame": all(
+            line["bbox_xyxy"][3] < height * 0.95 for line in lines
+        ),
+    }
+    return {"case": "bottom_frame_scan_edge", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "body_line_count": len(body_lines),
+            "excluded_count": len(manifest["excluded"]),
+            "region_count": len(regions)}
+
+
 def run_case(binary, work, mode, index, size=(1000, 1200)):
     source = work / f"{mode}_{index:02d}.png"
     out = work / f"out_{mode}_{index:02d}"
@@ -1046,6 +1132,7 @@ def main():
         results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
         results.append(run_faint_edge_recovery_case(args.binary.resolve(), work))
         results.append(run_edge_clipping_case(args.binary.resolve(), work))
+        results.append(run_bottom_frame_scan_case(args.binary.resolve(), work))
         results.append(run_heading_underline_case(args.binary.resolve(), work))
         results.extend(run_cli_cases(args.binary.resolve(), work))
         results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
@@ -1071,6 +1158,7 @@ def main():
             results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
             results.append(run_faint_edge_recovery_case(args.binary.resolve(), work))
             results.append(run_edge_clipping_case(args.binary.resolve(), work))
+            results.append(run_bottom_frame_scan_case(args.binary.resolve(), work))
             results.append(run_heading_underline_case(args.binary.resolve(), work))
             results.extend(run_cli_cases(args.binary.resolve(), work))
             results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
