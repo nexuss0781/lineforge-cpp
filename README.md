@@ -4,6 +4,11 @@ A fast, deterministic C++ command-line tool that turns scanned page images into 
 
 **This is a new project, not OCR-ALIGNER.** Public repository: [`nexuss0781/lineforge-cpp`](https://github.com/nexuss0781/lineforge-cpp).
 
+## V1.0.1: bounded parallel batch output
+
+- Keeps the existing line-level detector, individual `line_####.png` files, deterministic reading order, and manifest schema while encoding and writing multiple crops concurrently for large pages.
+- Limits active crop pixel buffers to 64 MiB (with a single larger crop processed alone), caps the writer pool at four threads, and stages a complete output directory before publishing it so failed runs do not expose partial results.
+
 ## V1.0.0: conservative line and crop recovery
 
 - Estimates glyph height from nearby rows inside each detected or explicitly supplied region. A suspiciously shallow candidate can expand only where dark-mask or locally faint grayscale evidence continues; short internal valleys allow detached marks without bridging a long blank gap.
