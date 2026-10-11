@@ -271,6 +271,89 @@ def run_vertical_font_scale_case(binary, work):
             "elapsed_ms": round(elapsed_ms, 2), "line_count": len(boxes)}
 
 
+def make_faint_edge_fixture(path, faint_ink):
+    """Create normal rows plus a short, low-contrast line with known ink bounds."""
+    im = Image.new("L", (1000, 650), 255)
+    draw = ImageDraw.Draw(im)
+    for index in range(7):
+        top = 30 + index * 75
+        pseudo_ethiopic(draw, 100, top, 900, top + 30,
+                        random.Random(100 + index), ink=12, scale=0.9)
+
+    top = 555
+    layer = Image.new("L", im.size, 255)
+    layer_draw = ImageDraw.Draw(layer)
+    pseudo_ethiopic(layer_draw, 100, top, 650, top + 30,
+                    random.Random(23), ink=0, scale=0.9)
+    ink_mask = ImageChops.difference(layer, Image.new("L", im.size, 255))
+    target = ink_mask.getbbox()
+    if target is None:
+        raise RuntimeError("faint-edge fixture unexpectedly rendered empty")
+    mask_pixels, page_pixels = ink_mask.load(), im.load()
+    for y in range(target[1], target[3]):
+        for x in range(target[0], target[2]):
+            if mask_pixels[x, y]:
+                page_pixels[x, y] = 12 if top + 9 <= y < top + 23 else faint_ink
+    im.save(path, "PNG")
+    return target
+
+
+def run_faint_edge_recovery_case(binary, work):
+    recovered_source = work / "faint_edges_recoverable.png"
+    recovered_out = work / "out_faint_edges_recoverable"
+    ambiguous_source = work / "faint_edges_ambiguous.png"
+    ambiguous_out = work / "out_faint_edges_ambiguous"
+    target = make_faint_edge_fixture(recovered_source, faint_ink=155)
+    make_faint_edge_fixture(ambiguous_source, faint_ink=165)
+
+    started = time.perf_counter()
+    recovered_proc = subprocess.run(
+        [str(binary), "--input", str(recovered_source), "--output", str(recovered_out),
+         "--layout", "single", "--no-deskew"], text=True, capture_output=True, check=False)
+    ambiguous_proc = subprocess.run(
+        [str(binary), "--input", str(ambiguous_source), "--output", str(ambiguous_out),
+         "--layout", "single", "--no-deskew"], text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if (recovered_proc.returncode != 0 or ambiguous_proc.returncode != 0 or
+            not (recovered_out / "manifest.json").exists() or
+            not (ambiguous_out / "manifest.json").exists()):
+        return {"case": "faint_edge_recovery", "pass": False,
+                "error": recovered_proc.stderr.strip() or ambiguous_proc.stderr.strip(),
+                "elapsed_ms": round(elapsed_ms, 2)}
+
+    recovered_manifest = json.loads((recovered_out / "manifest.json").read_text(encoding="utf-8"))
+    ambiguous_manifest = json.loads((ambiguous_out / "manifest.json").read_text(encoding="utf-8"))
+    recovered_lines, ambiguous_lines = recovered_manifest["lines"], ambiguous_manifest["lines"]
+    recovered_line, ambiguous_line = recovered_lines[-1], ambiguous_lines[-1]
+    source_box = recovered_line["source_crop_bbox_xyxy"]
+    source_image = Image.open(recovered_source).convert("L")
+    source_pixels = source_image.load()
+    x0, y0, x1, y1 = target
+    ink_pixels = [(x, y) for y in range(y0, y1) for x in range(x0, x1)
+                  if source_pixels[x, y] < 250]
+    retained_ink = sum(source_box[0] <= x < source_box[2] and
+                       source_box[1] <= y < source_box[3] for x, y in ink_pixels)
+    contains_all_ink = bool(ink_pixels) and retained_ink == len(ink_pixels)
+    review_reason = "shallow_candidate_expanded_from_local_ink"
+    checks = {
+        "eight_rows_detected_in_both_cases": len(recovered_lines) == 8 and len(ambiguous_lines) == 8,
+        "recoverable_faint_line_retains_all_source_ink": contains_all_ink,
+        "recovered_line_remains_visible_for_review": recovered_line["review_required"] and
+            review_reason in recovered_line["review_reasons"],
+        "ambiguous_faint_line_is_flagged_not_silently_trusted": ambiguous_line["review_required"] and
+            bool(ambiguous_line["review_reasons"]),
+        "row_order_is_monotonic": [line["bbox_xyxy"][1] for line in recovered_lines] ==
+            sorted(line["bbox_xyxy"][1] for line in recovered_lines),
+    }
+    return {"case": "faint_edge_recovery", "pass": all(checks.values()),
+            "checks": checks, "target_ink_bbox_xyxy": target,
+            "retained_source_ink_pixels": retained_ink,
+            "target_source_ink_pixels": len(ink_pixels),
+            "recovered_source_crop_bbox_xyxy": source_box,
+            "ambiguous_review_reasons": ambiguous_line["review_reasons"],
+            "elapsed_ms": round(elapsed_ms, 2), "line_count": len(recovered_lines)}
+
+
 def make_edge_clipping_fixture(path):
     im = Image.new("L", (1000, 900), 255)
     draw = ImageDraw.Draw(im)
@@ -458,7 +541,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.5.0" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 1.0.0" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -961,6 +1044,7 @@ def main():
         results.append(run_row_noise_case(args.binary.resolve(), work))
         results.append(run_dense_vertical_case(args.binary.resolve(), work))
         results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
+        results.append(run_faint_edge_recovery_case(args.binary.resolve(), work))
         results.append(run_edge_clipping_case(args.binary.resolve(), work))
         results.append(run_heading_underline_case(args.binary.resolve(), work))
         results.extend(run_cli_cases(args.binary.resolve(), work))
@@ -985,6 +1069,7 @@ def main():
             results.append(run_row_noise_case(args.binary.resolve(), work))
             results.append(run_dense_vertical_case(args.binary.resolve(), work))
             results.append(run_vertical_font_scale_case(args.binary.resolve(), work))
+            results.append(run_faint_edge_recovery_case(args.binary.resolve(), work))
             results.append(run_edge_clipping_case(args.binary.resolve(), work))
             results.append(run_heading_underline_case(args.binary.resolve(), work))
             results.extend(run_cli_cases(args.binary.resolve(), work))

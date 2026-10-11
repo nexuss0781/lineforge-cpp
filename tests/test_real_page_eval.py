@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from real_page_eval import evaluate_page
+from real_page_eval import aggregate_side_metrics, evaluate_page, nearest_rank_percentile
 
 
 class RealPageEvaluatorTests(unittest.TestCase):
@@ -17,6 +17,11 @@ class RealPageEvaluatorTests(unittest.TestCase):
                                 encoding="utf-8")
             return evaluate_page({"manifest": "manifest.json", "ground_truth_xyxy": truth},
                                  root, threshold)
+
+    def test_runtime_p95_uses_nearest_rank_for_small_samples(self):
+        self.assertEqual(nearest_rank_percentile([1.0, 2.0, 3.0, 4.0, 5.0], 0.95), 5.0)
+        self.assertEqual(nearest_rank_percentile([7.0], 0.95), 7.0)
+        self.assertIsNone(nearest_rank_percentile([], 0.95))
 
     def test_one_to_one_exact_lines(self):
         boxes = [[10, 10, 100, 30], [10, 40, 100, 60]]
@@ -146,7 +151,38 @@ class RealPageEvaluatorTests(unittest.TestCase):
         self.assertEqual(result["reading_order"]["pairwise_order_violations"], 1)
         self.assertEqual(result["reading_order"]["pairwise_order_accuracy"], 0.0)
         self.assertEqual(result["review_reason_counts"], {"edge_uncertain": 1})
+        self.assertEqual(result["source_line_box_retention"]["fully_retained"], 2)
+        self.assertEqual(result["source_line_box_retention"]["mean_area_coverage"], 1.0)
+        self.assertEqual(result["word_edge_retention"]["left_edges_retained"], 2)
+        self.assertEqual(result["word_edge_retention"]["right_edges_retained"], 1)
+        self.assertEqual(result["word_edge_retention"]["both_edges_retention_rate"], 0.5)
+        self.assertFalse(result["word_results"][1]["right_edge_retained"])
         self.assertEqual(result["runtime_ms"], 12.5)
+
+    def test_optional_side_split_reports_left_right_and_gutter_crossings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "image_size": {"width": 400, "height": 100},
+                "lines": [
+                    {"bbox_xyxy": [10, 10, 100, 30], "source_crop_bbox_xyxy": [9, 9, 101, 31]},
+                    {"bbox_xyxy": [210, 10, 300, 30], "source_crop_bbox_xyxy": [180, 9, 310, 31],
+                     "review_required": True},
+                ], "excluded": [],
+            }), encoding="utf-8")
+            result = evaluate_page({
+                "manifest": "manifest.json", "side_split_x": 200,
+                "ground_truth_xyxy": [[10, 10, 100, 30], [210, 10, 300, 30]],
+            }, root, 0.5)
+        self.assertEqual(result["side_metrics"]["cross_side_matches"], 0)
+        self.assertEqual(result["side_metrics"]["sides"]["left"]["true_positive_matches"], 1)
+        self.assertEqual(result["side_metrics"]["sides"]["left"]["recall"], 1.0)
+        self.assertEqual(result["side_metrics"]["sides"]["right"]["precision"], 1.0)
+        self.assertEqual(result["side_metrics"]["sides"]["right"]["gutter_crossing_crops"], 1)
+        combined = aggregate_side_metrics([result, result])
+        self.assertEqual(combined["annotated_pages"], 2)
+        self.assertEqual(combined["sides"]["right"]["ground_truth_lines"], 2)
 
     def test_clean_unflagged_page_has_no_crop_error_denominator(self):
         result = self.evaluate([[10, 10, 100, 30]], [[10, 10, 100, 30]])
