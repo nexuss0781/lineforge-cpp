@@ -19,6 +19,8 @@
 #include <png.h>
 #include <setjmp.h>
 
+#include "layout.hpp"
+
 namespace fs = std::filesystem;
 static constexpr uint64_t MAX_PIXELS = 100000000ULL;
 
@@ -33,6 +35,7 @@ struct Band {
     uint64_t ink = 0;
     int components = 0;
     bool page_number = false;
+    int region = 0;
 };
 
 static void require(bool ok, const std::string& message) {
@@ -442,15 +445,27 @@ static void mark_likely_page_numbers(std::vector<Band>& bands, int w, int h, boo
     if (wide_heights.empty()) return;
     std::sort(wide_heights.begin(), wide_heights.end());
     const double median_h = wide_heights[wide_heights.size() / 2];
-    const size_t last = bands.size() - 1;
     for (size_t i = 0; i < bands.size(); ++i) {
         const auto& b = bands[i];
         const double bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
         const double center = (b.x0 + b.x1) / 2.0;
         const bool compact = bw <= w * 0.16 && bh <= median_h * 1.28 && b.components <= 8;
-        const bool centered = std::abs(center - w / 2.0) <= w * 0.21;
+        const bool centered_on_page = std::min({std::abs(center - w * 0.25),
+                                                std::abs(center - w * 0.50),
+                                                std::abs(center - w * 0.75)}) <= w * 0.11;
         const bool lower_half = b.y0 >= h * 0.40;
-        if (i == last && compact && centered && lower_half) bands[i].page_number = true;
+        bool terminal_in_lane = true;
+        for (size_t j = 0; j < bands.size(); ++j) {
+            if (i == j) continue;
+            const auto& later = bands[j];
+            const double later_center = (later.x0 + later.x1) / 2.0;
+            if (later.y0 > b.y1 + 1 && std::abs(later_center - center) <= w * 0.18) {
+                terminal_in_lane = false;
+                break;
+            }
+        }
+        if (compact && centered_on_page && lower_half && terminal_in_lane)
+            bands[i].page_number = true;
     }
 }
 
@@ -479,22 +494,62 @@ static std::string json_escape(const std::string& value) {
     return out;
 }
 
-struct Options { std::string input, output; bool deskew = true, filter_page_number = true, debug = false; };
+struct Options {
+    std::string input, output;
+    std::string layout = "auto";
+    std::string reading_order = "ltr";
+    std::vector<std::array<int, 4>> custom_regions;
+    bool deskew = true, filter_page_number = true, debug = false;
+};
+
+static std::array<int, 4> parse_region(const std::string& value) {
+    std::array<int, 4> result{};
+    size_t begin = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+        const size_t end = value.find(',', begin);
+        if ((i + 1 < result.size() && end == std::string::npos) ||
+            (i + 1 == result.size() && end != std::string::npos))
+            throw std::runtime_error("--region must be x0,y0,x1,y1 using half-open coordinates");
+        const std::string part = value.substr(begin, end == std::string::npos ? end : end - begin);
+        size_t consumed = 0;
+        try {
+            const long parsed = std::stol(part, &consumed);
+            require(consumed == part.size() && parsed >= 0 && parsed <= std::numeric_limits<int>::max(),
+                    "--region coordinates must be non-negative integers");
+            result[i] = static_cast<int>(parsed);
+        } catch (const std::exception&) {
+            throw std::runtime_error("--region coordinates must be non-negative integers");
+        }
+        begin = end == std::string::npos ? value.size() : end + 1;
+    }
+    require(result[0] < result[2] && result[1] < result[3],
+            "--region must have positive width and height");
+    return result;
+}
 
 static Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::cout << "linecrop 0.1.0\n"; std::exit(0); }
+        if (arg == "--version") { std::cout << "linecrop 0.2.0\n"; std::exit(0); }
         else if (arg == "--no-deskew") o.deskew = false;
         else if (arg == "--keep-page-numbers") o.filter_page_number = false;
         else if (arg == "--debug") o.debug = true;
         else if (arg == "--input" && i + 1 < argc) o.input = argv[++i];
         else if (arg == "--output" && i + 1 < argc) o.output = argv[++i];
+        else if (arg == "--layout" && i + 1 < argc) {
+            o.layout = argv[++i];
+            require(o.layout == "auto" || o.layout == "single", "--layout must be auto or single");
+        }
+        else if (arg == "--reading-order" && i + 1 < argc) {
+            o.reading_order = argv[++i];
+            require(o.reading_order == "ltr" || o.reading_order == "rtl", "--reading-order must be ltr or rtl");
+        }
+        else if (arg == "--region" && i + 1 < argc) o.custom_regions.push_back(parse_region(argv[++i]));
         else if (!arg.empty() && arg[0] != '-' && o.input.empty()) o.input = arg;
         else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
-    require(!o.input.empty(), "usage: linecrop --input page.jpg --output out_dir [--no-deskew] [--keep-page-numbers] [--debug]");
+    require(!o.input.empty(), "usage: linecrop --input page.jpg --output out_dir [--layout auto|single] [--reading-order ltr|rtl] [--region x0,y0,x1,y1 ...] [--no-deskew] [--keep-page-numbers] [--debug]");
     require(!o.output.empty(), "--output DIR is required");
     return o;
 }
@@ -519,18 +574,77 @@ int main(int argc, char** argv) {
         const auto deskewed = std::chrono::steady_clock::now();
         Image processed = rotate_gray(original, angle);
         if (std::abs(angle) >= 1e-8) mask = rotate_mask(mask, original.width, original.height, angle);
-        auto bands = find_bands(mask, processed.width, processed.height);
+
+        std::vector<LayoutRegion> regions;
+        std::string layout_name = opt.custom_regions.empty() ? opt.layout : "custom";
+        const std::string reading_order_name = opt.custom_regions.empty() ? opt.reading_order : "explicit";
+        if (!opt.custom_regions.empty()) {
+            for (const auto& r : opt.custom_regions) {
+                require(r[0] < r[2] && r[1] < r[3] && r[2] <= processed.width && r[3] <= processed.height,
+                        "custom --region is outside the deskewed image bounds");
+                regions.push_back(LayoutRegion{r[0], r[1], r[2], r[3]});
+            }
+            for (size_t i = 0; i < regions.size(); ++i) for (size_t j = i + 1; j < regions.size(); ++j) {
+                const bool overlap = regions[i].x0 < regions[j].x1 && regions[j].x0 < regions[i].x1 &&
+                                     regions[i].y0 < regions[j].y1 && regions[j].y0 < regions[i].y1;
+                require(!overlap, "custom --region rectangles must not overlap");
+            }
+        } else if (opt.layout == "single") {
+            regions.push_back(LayoutRegion{0, 0, processed.width, processed.height});
+        } else {
+            regions = lineforge_layout::detect_regions(mask, processed.width, processed.height,
+                                                       opt.reading_order == "rtl");
+        }
+
+        std::vector<Band> bands;
+        std::vector<size_t> lines_per_region(regions.size(), 0);
+        for (size_t region_index = 0; region_index < regions.size(); ++region_index) {
+            const auto& r = regions[region_index];
+            const int rw = r.x1 - r.x0, rh = r.y1 - r.y0;
+            if (rw <= 0 || rh <= 0) continue;
+            std::vector<uint8_t> local_mask(static_cast<size_t>(rw) * rh);
+            for (int y = 0; y < rh; ++y) {
+                const auto source = mask.begin() + static_cast<size_t>(r.y0 + y) * processed.width + r.x0;
+                std::copy_n(source, rw, local_mask.begin() + static_cast<size_t>(y) * rw);
+            }
+            auto local_bands = find_bands(local_mask, rw, rh);
+            for (auto& b : local_bands) {
+                b.x0 += r.x0; b.x1 += r.x0;
+                b.y0 += r.y0; b.y1 += r.y0;
+                b.region = static_cast<int>(region_index + 1);
+            }
+            lines_per_region[region_index] = local_bands.size();
+            bands.insert(bands.end(), local_bands.begin(), local_bands.end());
+        }
         mark_likely_page_numbers(bands, processed.width, processed.height, opt.filter_page_number);
         const auto segmented = std::chrono::steady_clock::now();
-        if (opt.debug) std::cerr << "debug: deskew_degrees=" << angle << " detected_bands=" << bands.size() << "\n";
+        if (opt.debug) {
+            std::cerr << "debug: deskew_degrees=" << angle << " layout=" << layout_name
+                      << " reading_order=" << reading_order_name << " regions=" << regions.size()
+                      << " detected_bands=" << bands.size() << "\n";
+            for (size_t i = 0; i < regions.size(); ++i) {
+                const auto& r = regions[i];
+                std::cerr << "debug: region=" << i + 1 << " bbox=[" << r.x0 << "," << r.y0 << ","
+                          << r.x1 << "," << r.y1 << "] lines=" << lines_per_region[i] << "\n";
+            }
+        }
         fs::create_directories(opt.output);
         std::ofstream manifest(fs::path(opt.output) / "manifest.json");
         require(manifest.good(), "cannot create manifest in output directory");
-        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"0.1.0\",\n";
+        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"0.2.0\",\n";
         manifest << "  \"input\": \"" << json_escape(fs::path(opt.input).filename().string()) << "\",\n";
         manifest << "  \"image_size\": {\"width\": " << processed.width << ", \"height\": " << processed.height << "},\n";
         manifest << "  \"deskew_correction_degrees\": " << std::fixed << std::setprecision(3) << angle << ",\n";
-        manifest << "  \"page_number_filter\": \"conservative geometric heuristic; manually review\",\n  \"lines\": [\n";
+        manifest << "  \"layout\": {\"mode\": \"" << layout_name << "\", \"reading_order\": \""
+                 << reading_order_name << "\", \"regions\": [";
+        for (size_t i = 0; i < regions.size(); ++i) {
+            const auto& r = regions[i];
+            if (i) manifest << ", ";
+            manifest << "{\"id\": " << i + 1 << ", \"bbox_xyxy\": [" << r.x0 << ", " << r.y0
+                     << ", " << r.x1 << ", " << r.y1 << "], \"detected_lines\": "
+                     << lines_per_region[i] << "}";
+        }
+        manifest << "]},\n  \"page_number_filter\": \"conservative geometric heuristic; manually review\",\n  \"lines\": [\n";
         size_t kept = 0, skipped = 0;
         for (const auto& b : bands) {
             if (b.page_number) { ++skipped; continue; }
@@ -539,7 +653,8 @@ int main(int argc, char** argv) {
             write_png_gray(fs::path(opt.output) / name, crop);
             if (kept) manifest << ",\n";
             manifest << "    {\"file\": \"" << name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
-                     << "], \"crop_size\": [" << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink << "}";
+                     << "], \"crop_size\": [" << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
+                     << ", \"region\": " << b.region << "}";
             ++kept;
         }
         manifest << "\n  ],\n  \"excluded\": [";
@@ -547,7 +662,8 @@ int main(int argc, char** argv) {
         for (const auto& b : bands) if (b.page_number) {
             if (!first) manifest << ", ";
             first = false;
-            manifest << "{\"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1 << "], \"reason\": \"likely_centered_page_number\", \"review\": true}";
+            manifest << "{\"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
+                     << "], \"reason\": \"likely_centered_page_number\", \"review\": true, \"region\": " << b.region << "}";
         }
         manifest << "],\n  \"detected_bands\": " << bands.size() << "\n}\n";
         manifest.close();

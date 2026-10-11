@@ -6,16 +6,16 @@
 
 ## Results
 
-- **31/31 checks passed**: 24 synthetic pages (clean, low contrast, gradient-lit, noise, blur, JPEG, skew, and Ethiopic-font fixtures; three seeds each), two uniform blank-page checks, one 3600×4320 (15.55 MP) throughput case, and four CLI/error-path checks.
-- **CTest:** 1/1 test passed; the registered test runs the same 31-case suite.
-- The supplied 1212×101 JPEG regression produced one retained text-line crop (`[297, 4, 1094, 29]`) and flagged the centered page number (`[805, 49, 820, 71]`) for exclusion review. The scan and output crop are intentionally not included in this project.
-- On this benchmark run, cases had **75.70 ms median**, **115.46 ms p95**, and **3.01 s summed process time**. The 15.55 MP page took **853 ms** end-to-end. The supplied sample took **16.70 ms** in its recorded run.
-- AddressSanitizer and UndefinedBehaviorSanitizer smoke runs passed on the supplied JPEG, Ethiopic-font PNG, blank PNG, and 15.55 MP PNG.
+- **38/38 checks passed**: 24 synthetic pages (clean, low contrast, gradient-lit, noise, blur, JPEG, skew, and Ethiopic-font fixtures; three seeds each), two blank-page checks, one 3600×4320 (15.55 MP) throughput case, four CLI/error-path checks, and seven layout-specific checks.
+- Layout fixtures verified facing-page spreads, two-column left-to-right and right-to-left ordering, a mixed newspaper page with a full-width headline, explicitly ordered custom regions, the single-region override, and rejection of an out-of-bounds custom region.
+- **CTest:** 1/1 test passed; the registered test runs the same 38-case suite.
+- On this run, cases had **73.05 ms median**, **116.25 ms p95**, and **3.44 s summed process time**. The 15.55 MP page took **850.93 ms** end-to-end.
+- AddressSanitizer and UndefinedBehaviorSanitizer full-suite run: **38/38 checks passed**, with leak detection enabled.
 
 ## What was verified
 
-Fixture assertions check retained line count, reading order, crop dimensions and widths, PNG output existence, conservative footer-number handling, mild-skew estimate magnitude, blank-page rejection, `--keep-page-numbers`, `--no-deskew`, version output, and invalid-input handling. Both JPEG and PNG decoding were exercised. The example crop was visually inspected.
+Fixture assertions check retained line count, crop dimensions and output files, line and column reading order, region metadata, custom-region order, conservative page-number handling including both leaves of a spread, mild-skew estimates, blank-page rejection, CLI overrides, version output, invalid input, and region-bound validation. Both JPEG and PNG decoding were exercised.
 
 ## Limits
 
-These checks validate synthetic/document-layout geometry and selected regressions only. They are **not** human-annotated page-level precision/recall, a broad real-world corpus benchmark, or OCR character/word accuracy. Timings are from one local computer and are not a performance guarantee. The page-number filter is heuristic; review its manifest exclusions and inspect crops. Before production use, benchmark against representative, held-out pages with human-annotated line boxes and separately validate exact transcripts.
+These checks validate synthetic geometry only. They are **not** human-annotated page-level precision/recall, a broad real-world corpus benchmark, or OCR character/word accuracy. The automatic layout detector relies on whitespace gutters; overlapping articles, weak/absent gutters, tables, marginalia, and irregular layouts may require explicit regions and human review. Timings are from one local computer and are not a performance guarantee. Before production use, benchmark against representative held-out pages with human-annotated line boxes and separately validate exact transcripts.
