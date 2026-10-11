@@ -48,6 +48,61 @@ def inside_roi(box: Box, roi: Box | None) -> bool:
     return roi[0] <= center_x < roi[2] and roi[1] <= center_y < roi[3]
 
 
+def contains(outer: Box, inner: Box) -> bool:
+    return (outer[0] <= inner[0] and outer[1] <= inner[1] and
+            outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
+def point_in_region(region: dict[str, Any], x: float, y: float) -> bool:
+    box = as_box(region["bbox_xyxy"])
+    if not (box[0] <= x < box[2] and box[1] <= y < box[3]):
+        return False
+
+    def edge_value(key: str, fallback: float) -> float:
+        points = region.get(key)
+        if not points:
+            return fallback
+        ordered = sorted(((float(px), float(py)) for px, py in points), key=lambda point: point[1])
+        if y <= ordered[0][1]:
+            return ordered[0][0]
+        if y >= ordered[-1][1]:
+            return ordered[-1][0]
+        for (x0, y0), (x1, y1) in zip(ordered, ordered[1:]):
+            if y0 <= y <= y1:
+                if y1 == y0:
+                    return (x0 + x1) / 2
+                ratio = (y - y0) / (y1 - y0)
+                return x0 + ratio * (x1 - x0)
+        return fallback
+
+    left = edge_value("left_edge_xy", box[0])
+    right = edge_value("right_edge_xy", box[2])
+    return left <= x < right
+
+
+def order_summary(predicted_truth: list[int], truth_order: list[int]) -> dict[str, Any]:
+    rank = {truth_index: position for position, truth_index in enumerate(truth_order)}
+    observed = [truth_index for truth_index in predicted_truth if truth_index in rank]
+    concordant = discordant = 0
+    for i, first in enumerate(observed):
+        for second in observed[i + 1:]:
+            if rank[first] < rank[second]:
+                concordant += 1
+            else:
+                discordant += 1
+    pairs = concordant + discordant
+    return {
+        "matched_lines_in_order": len(observed),
+        "ground_truth_order": truth_order,
+        "predicted_order_of_matched_truth_indices": observed,
+        "concordant_pairs": concordant,
+        "comparable_pairs": pairs,
+        "pairwise_order_accuracy": round(concordant / pairs, 4) if pairs else None,
+        "pairwise_order_violations": discordant,
+        "exact_order": observed == [i for i in truth_order if i in set(observed)],
+    }
+
+
 def vertical_boundary_summary(errors: list[tuple[float, float]]) -> dict[str, Any]:
     top = [error[0] for error in errors]
     bottom = [error[1] for error in errors]
@@ -96,6 +151,9 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
     predicted = [as_box(line["bbox_xyxy"]) for line in line_items]
     predicted = [box for box in predicted if inside_roi(box, roi)]
     selected_items = [line for line in line_items if inside_roi(as_box(line["bbox_xyxy"]), roi)]
+    excluded_items = manifest.get("excluded", [])
+    selected_excluded = [item for item in excluded_items
+                         if inside_roi(as_box(item["bbox_xyxy"]), roi)]
 
     pairs: list[tuple[float, int, int]] = []
     for pi, pred in enumerate(predicted):
@@ -124,6 +182,87 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         (match["top_boundary_error_px"], match["bottom_boundary_error_px"])
         for match in matches
     ])
+
+    matched_truth_to_pred = {m["truth_index"]: m["prediction_index"] for m in matches}
+    predicted_truth_indices = [matches_by_pred for matches_by_pred in sorted(
+        matched_truth_to_pred, key=lambda index: matched_truth_to_pred[index])]
+    truth_order = [int(i) for i in page.get("ground_truth_order", range(len(truth)))]
+    if sorted(truth_order) != list(range(len(truth))):
+        raise ValueError("ground_truth_order must be a permutation of ground-truth line indices")
+    reading_order = order_summary(predicted_truth_indices, truth_order)
+
+    word_labels = page.get("ground_truth_words_xyxy", [])
+    retained_words = 0
+    word_results: list[dict[str, Any]] = []
+    for word_index, word in enumerate(word_labels):
+        if isinstance(word, dict):
+            word_box = as_box(word["bbox_xyxy"])
+            line_index = word.get("line_index")
+        else:
+            word_box = as_box(word)
+            line_index = None
+        if line_index is not None:
+            line_index = int(line_index)
+            if not 0 <= line_index < len(truth):
+                raise ValueError(f"word label line_index out of range: {line_index}")
+            pred_index = matched_truth_to_pred.get(line_index)
+            candidates = [selected_items[pred_index]] if pred_index is not None else []
+        else:
+            candidates = selected_items
+        contained_by_crop = False
+        for item in candidates:
+            source = item.get("source_crop_bbox_xyxy", item["bbox_xyxy"])
+            if contains(as_box(source), word_box):
+                contained_by_crop = True
+                break
+        retained_words += int(contained_by_crop)
+        word_results.append({"word_index": word_index, "line_index": line_index,
+                             "retained_inside_matched_crop": contained_by_crop})
+    word_retention_rate = retained_words / len(word_labels) if word_labels else None
+
+    expected_region_ids = page.get("ground_truth_region_ids", [])
+    region_boxes = page.get("ground_truth_regions", {})
+    prediction_regions = {str(region["id"]): region
+                         for region in manifest.get("layout", {}).get("regions", [])}
+    region_assignment_count = 0
+    region_assignment_errors = 0
+    if expected_region_ids:
+        if len(expected_region_ids) != len(truth):
+            raise ValueError("ground_truth_region_ids must align with ground_truth_xyxy")
+        for gi, pred_index in matched_truth_to_pred.items():
+            expected_id = expected_region_ids[gi]
+            if expected_id is None:
+                continue
+            expected_value = region_boxes.get(str(expected_id)) if isinstance(region_boxes, dict) else None
+            if expected_value is None:
+                raise ValueError(f"missing ground_truth_regions entry for {expected_id!r}")
+            expected_box = as_box(expected_value.get("bbox_xyxy", expected_value)
+                                  if isinstance(expected_value, dict) else expected_value)
+            item = selected_items[pred_index]
+            predicted_region = prediction_regions.get(str(item.get("region")))
+            cx = (truth[gi][0] + truth[gi][2]) / 2
+            cy = (truth[gi][1] + truth[gi][3]) / 2
+            correct = (expected_box[0] <= cx < expected_box[2] and
+                       expected_box[1] <= cy < expected_box[3] and
+                       predicted_region is not None and point_in_region(predicted_region, cx, cy))
+            region_assignment_count += 1
+            region_assignment_errors += int(not correct)
+    region_assignment_accuracy = (
+        (region_assignment_count - region_assignment_errors) / region_assignment_count
+        if region_assignment_count else None
+    )
+
+    review_reason_counts: dict[str, int] = {}
+    for item in selected_items:
+        if item.get("review_required", False):
+            for reason in item.get("review_reasons", []):
+                review_reason_counts[reason] = review_reason_counts.get(reason, 0) + 1
+    for item in selected_excluded:
+        if item.get("review_required", item.get("review", True)):
+            reason = item.get("reason", "unspecified")
+            review_reason_counts[reason] = review_reason_counts.get(reason, 0) + 1
+    timing = manifest.get("timing_ms", {})
+    runtime_ms = timing.get("total_before_manifest_finalize")
 
     coverage_by_truth: list[list[tuple[int, float]]] = [[] for _ in truth]
     coverage_by_pred: list[list[tuple[int, float]]] = [[] for _ in predicted]
@@ -170,16 +309,14 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         i for i, item in enumerate(selected_items) if item.get("review_required", False)
     }
     flagged_error_predictions = error_predictions & review_prediction_indices
-    excluded_items = manifest.get("excluded", [])
-    selected_excluded = [item for item in excluded_items
-                         if inside_roi(as_box(item["bbox_xyxy"]), roi)]
     review_items = len(review_prediction_indices) + sum(
         bool(item.get("review_required", item.get("review", True))) for item in selected_excluded
     )
     candidate_count = len(predicted) + len(selected_excluded)
     page_has_error = bool(
         len(truth) - len(matched_truth) or error_predictions or cut_truth or
-        merged_predictions or split_truth
+        merged_predictions or split_truth or len(word_labels) - retained_words or
+        region_assignment_errors or reading_order["pairwise_order_violations"]
     )
     page_has_review_alert = review_items > 0
     return {
@@ -205,6 +342,18 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         "page_has_segmentation_error": page_has_error,
         "page_has_review_alert": page_has_review_alert,
         "vertical_boundary": vertical_boundary,
+        "ground_truth_words": len(word_labels),
+        "retained_words": retained_words,
+        "clipped_or_unassigned_words": len(word_labels) - retained_words,
+        "word_retention_rate": round(word_retention_rate, 4) if word_retention_rate is not None else None,
+        "word_results": word_results,
+        "region_assignment_count": region_assignment_count,
+        "region_assignment_errors": region_assignment_errors,
+        "region_assignment_accuracy": (round(region_assignment_accuracy, 4)
+                                        if region_assignment_accuracy is not None else None),
+        "reading_order": reading_order,
+        "review_reason_counts": review_reason_counts,
+        "runtime_ms": runtime_ms,
         "matches": matches,
     }
 
@@ -232,6 +381,19 @@ def main() -> int:
     total_reviews = sum(page["review_candidates"] for page in pages)
     total_crop_errors = sum(page["crop_error_candidates"] for page in pages)
     total_reviewed_crop_errors = sum(page["reviewed_crop_errors"] for page in pages)
+    total_words = sum(page["ground_truth_words"] for page in pages)
+    total_retained_words = sum(page["retained_words"] for page in pages)
+    total_region_assignments = sum(page["region_assignment_count"] for page in pages)
+    total_region_errors = sum(page["region_assignment_errors"] for page in pages)
+    order_pairs = sum(page["reading_order"]["comparable_pairs"] for page in pages)
+    concordant_order_pairs = sum(page["reading_order"]["concordant_pairs"] for page in pages)
+    order_violations = sum(page["reading_order"]["pairwise_order_violations"] for page in pages)
+    runtimes = [float(page["runtime_ms"]) for page in pages if page["runtime_ms"] is not None]
+    sorted_runtimes = sorted(runtimes)
+    review_reason_totals: dict[str, int] = {}
+    for page in pages:
+        for reason, count in page["review_reason_counts"].items():
+            review_reason_totals[reason] = review_reason_totals.get(reason, 0) + count
     all_vertical_errors = [
         (match["top_boundary_error_px"], match["bottom_boundary_error_px"])
         for page in pages for match in page["matches"]
@@ -241,7 +403,7 @@ def main() -> int:
     result = {
         "benchmark": "hand-labeled line-crop evaluation",
         "matching": f"greedy one-to-one IoU >= {threshold:.3f}; boxes are xyxy with exclusive right/bottom edges",
-        "scope_note": "Only annotations and optional ROIs listed in the input are scored. Excluded review candidates are not counted as predicted crops.",
+        "scope_note": "Only annotations and optional ROIs listed in the input are scored. Optional word, region, and reading-order metrics require independent annotations. Excluded review candidates are not counted as predicted crops.",
         "pages": pages,
         "aggregate": {
             "pages": len(pages), "ground_truth_lines": total_gt,
@@ -263,6 +425,26 @@ def main() -> int:
             "pages_with_segmentation_errors": len(error_pages),
             "error_page_review_recall": (round(reviewed_error_pages / len(error_pages), 4)
                                          if error_pages else None),
+            "ground_truth_words": total_words,
+            "retained_words": total_retained_words,
+            "clipped_or_unassigned_words": total_words - total_retained_words,
+            "word_retention_rate": round(total_retained_words / total_words, 4) if total_words else None,
+            "region_assignments": total_region_assignments,
+            "region_assignment_errors": total_region_errors,
+            "region_assignment_accuracy": (round((total_region_assignments - total_region_errors) /
+                                                  total_region_assignments, 4)
+                                           if total_region_assignments else None),
+            "reading_order_comparable_pairs": order_pairs,
+            "reading_order_violations": order_violations,
+            "reading_order_pairwise_accuracy": (round(concordant_order_pairs / order_pairs, 4)
+                                                if order_pairs else None),
+            "review_reason_counts": review_reason_totals,
+            "pages_with_runtime": len(runtimes),
+            "runtime_ms_mean": round(statistics.mean(runtimes), 3) if runtimes else None,
+            "runtime_ms_median": round(statistics.median(runtimes), 3) if runtimes else None,
+            "runtime_ms_p95": (round(sorted_runtimes[min(len(sorted_runtimes) - 1,
+                                                       int((len(sorted_runtimes) - 1) * 0.95))], 3)
+                               if runtimes else None),
             "vertical_boundary": vertical_boundary_summary(all_vertical_errors),
         },
     }

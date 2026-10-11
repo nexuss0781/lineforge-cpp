@@ -628,18 +628,22 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
     int typical = 12;
     if (!heights.empty()) {
         std::sort(heights.begin(), heights.end());
-        typical = heights[heights.size() / 2];
+        // The median can be inflated when two or more tightly spaced rows have
+        // already joined into one raw projection run. A lower quartile is a
+        // more stable estimate of an individual glyph row in dense scans.
+        typical = heights[(heights.size() - 1) / 4];
     }
     if (typical > h * 0.20) typical = std::max(8, h / 24);
     std::vector<int> pitches;
     for (size_t i = 1; i < raw.size(); ++i) {
         const int pitch = (raw[i].first + raw[i].second - raw[i - 1].first - raw[i - 1].second) / 2;
-        if (pitch >= typical + std::max(2, typical / 3) && pitch <= typical * 5) pitches.push_back(pitch);
+        if (pitch >= std::max(3, static_cast<int>(std::lround(typical * 0.85))) &&
+            pitch <= typical * 5) pitches.push_back(pitch);
     }
     int line_pitch = typical * 2;
     if (!pitches.empty()) {
-        std::nth_element(pitches.begin(), pitches.begin() + pitches.size() / 2, pitches.end());
-        line_pitch = pitches[pitches.size() / 2];
+        std::sort(pitches.begin(), pitches.end());
+        line_pitch = pitches[(pitches.size() - 1) / 4];
     }
     const bool compact_line_region = h < std::max(80, w / 16);
     const int merge_gap = compact_line_region ? h :
@@ -659,8 +663,8 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
     // local-depth threshold plus minimum piece height provide the safeguards.
     const int min_valley = 1;
     const int min_fragment_height = std::max(5, static_cast<int>(std::lround(typical * 0.58)));
-    const int oversized_limit = std::max(static_cast<int>(std::lround(typical * 2.0)),
-                                         static_cast<int>(std::lround(line_pitch * 1.85)));
+    const int oversized_limit = std::max(static_cast<int>(std::lround(typical * 1.8)),
+                                         static_cast<int>(std::lround(line_pitch * 1.05)));
     for (const auto& run : merged) {
         const int run_height = run.second - run.first + 1;
         if (debug && run_height > oversized_limit) {
@@ -1016,6 +1020,7 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
             const int original_y1_exclusive = band.y1 + 1;
             const int ink_height = original_y1_exclusive - original_y0;
             const int target_pad = std::max(1, static_cast<int>(std::lround(ink_height * 0.18)));
+            const int source_safety_pad = 2;
 
             int refined_y0 = original_y0;
             int refined_y1_exclusive = original_y1_exclusive;
@@ -1023,7 +1028,7 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
             int crop_y1_exclusive = std::min(height, original_y1_exclusive + target_pad);
             if (i > 0 && shared_cut[i - 1] >= 0) {
                 refined_y0 = shared_cut[i - 1];
-                crop_y0 = shared_cut[i - 1];
+                crop_y0 = std::max(0, shared_cut[i - 1] - source_safety_pad);
             } else {
                 int pad = target_pad;
                 if (i > 0) {
@@ -1032,11 +1037,11 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
                     pad = std::min(pad, std::max(0, available / 2));
                 }
                 refined_y0 = std::max(0, original_y0 - pad);
-                crop_y0 = refined_y0;
+                crop_y0 = std::max(0, original_y0 - std::max(pad, source_safety_pad));
             }
             if (i + 1 < indices.size() && shared_cut[i] >= 0) {
                 refined_y1_exclusive = shared_cut[i];
-                crop_y1_exclusive = shared_cut[i];
+                crop_y1_exclusive = std::min(height, shared_cut[i] + source_safety_pad);
             } else {
                 int pad = target_pad;
                 if (i + 1 < indices.size()) {
@@ -1045,7 +1050,8 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
                     pad = std::min(pad, std::max(0, available / 2));
                 }
                 refined_y1_exclusive = std::min(height, original_y1_exclusive + pad);
-                crop_y1_exclusive = refined_y1_exclusive;
+                crop_y1_exclusive = std::min(height, original_y1_exclusive +
+                                                    std::max(pad, source_safety_pad));
             }
             band.y0 = std::clamp(refined_y0, 0, height - 1);
             band.y1 = std::clamp(refined_y1_exclusive - 1, band.y0, height - 1);
@@ -1066,11 +1072,11 @@ static Image crop_with_white_padding(const Image& gray, const Band& b,
     const int line_h = ink_y1 - ink_y0 + 1;
     // Detached Ethiopic marks often sit above or below the main glyph bodies.
     const int pad_y = std::max(3, static_cast<int>(std::lround(line_h * 0.55)));
-    const int pad_x = std::max(4, static_cast<int>(std::lround(line_h * 0.18)));
+    const int pad_x = std::max(12, static_cast<int>(std::lround(line_h * 0.70)));
     const int crop_scale_height = std::max(line_h, b.y1 - b.y0 + 1);
     int x0 = std::max(0, b.x0 - pad_x);
     int x1 = std::min(gray.width - 1, b.x1 + pad_x);
-    const int gutter_pad = std::max(pad_x, static_cast<int>(std::lround(crop_scale_height * 0.55)));
+    const int gutter_pad = std::max(pad_x, static_cast<int>(std::lround(crop_scale_height * 0.85)));
     const int near_gutter_edge = std::max(2, static_cast<int>(std::lround(crop_scale_height * 0.12)));
     if (b.gutter_crop_x0 >= 0 && b.region_x0 >= 0 &&
         b.x0 <= b.region_x0 + near_gutter_edge) {
@@ -1092,6 +1098,25 @@ static Image crop_with_white_padding(const Image& gray, const Band& b,
         std::copy_n(gray.pixels.begin() + static_cast<size_t>(y0 + y) * gray.width + x0, ow,
                     out.pixels.begin() + static_cast<size_t>(y + border) * out.width + border);
     return out;
+}
+
+static void mask_crop_to_curved_region(Image& crop, const LayoutRegion& region,
+                                       const std::array<int, 4>& source_bbox) {
+    if (!region.curved_left && !region.curved_right) return;
+    const int border_x = (crop.width - (source_bbox[2] - source_bbox[0])) / 2;
+    const int border_y = (crop.height - (source_bbox[3] - source_bbox[1])) / 2;
+    for (int y = source_bbox[1]; y < source_bbox[3]; ++y) {
+        if (y < region.y0 || y >= region.y1) continue;
+        const int left = lineforge_layout::left_at(region, y);
+        const int right = lineforge_layout::right_at(region, y);
+        for (int x = source_bbox[0]; x < source_bbox[2]; ++x) {
+            if (x >= left && x < right) continue;
+            const int cx = x - source_bbox[0] + border_x;
+            const int cy = y - source_bbox[1] + border_y;
+            if (cx >= 0 && cx < crop.width && cy >= 0 && cy < crop.height)
+                crop.pixels[static_cast<size_t>(cy) * crop.width + cx] = 255;
+        }
+    }
 }
 
 static std::string json_escape(const std::string& value) {
@@ -1149,7 +1174,8 @@ static Options parse_args(int argc, char** argv) {
         else if (arg == "--output" && i + 1 < argc) o.output = argv[++i];
         else if (arg == "--layout" && i + 1 < argc) {
             o.layout = argv[++i];
-            require(o.layout == "auto" || o.layout == "single", "--layout must be auto or single");
+            require(o.layout == "auto" || o.layout == "single" || o.layout == "baseline",
+                    "--layout must be auto, baseline, or single");
         }
         else if (arg == "--reading-order" && i + 1 < argc) {
             o.reading_order = argv[++i];
@@ -1159,7 +1185,7 @@ static Options parse_args(int argc, char** argv) {
         else if (!arg.empty() && arg[0] != '-' && o.input.empty()) o.input = arg;
         else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
-    require(!o.input.empty(), "usage: linecrop --input page.jpg --output out_dir [--layout auto|single] [--reading-order ltr|rtl] [--region x0,y0,x1,y1 ...] [--no-deskew] [--keep-page-numbers] [--debug]");
+    require(!o.input.empty(), "usage: linecrop --input page.jpg --output out_dir [--layout auto|baseline|single] [--reading-order ltr|rtl] [--region x0,y0,x1,y1 ...] [--no-deskew] [--keep-page-numbers] [--debug]");
     require(!o.output.empty(), "--output DIR is required");
     return o;
 }
@@ -1215,9 +1241,10 @@ int main(int argc, char** argv) {
         }
         bool preserve_vertical_gutter = false;
         lineforge_layout::Cut pre_deskew_cut;
-        if (opt.deskew && opt.layout == "auto" && opt.custom_regions.empty()) {
+        if (opt.deskew && (opt.layout == "auto" || opt.layout == "baseline") && opt.custom_regions.empty()) {
             pre_deskew_cut = lineforge_layout::find_cut(
-                mask, original.width, LayoutRegion{0, 0, original.width, original.height}, original.height);
+                mask, original.width, LayoutRegion{0, 0, original.width, original.height}, original.height,
+                opt.layout == "auto");
             preserve_vertical_gutter = pre_deskew_cut.found && pre_deskew_cut.vertical;
         }
         const double angle = opt.deskew && !preserve_vertical_gutter
@@ -1226,9 +1253,10 @@ int main(int argc, char** argv) {
         Image processed = rotate_gray(original, angle);
         if (std::abs(angle) >= 1e-8) mask = rotate_mask(mask, original.width, original.height, angle);
 
-        if (opt.debug && opt.layout == "auto" && opt.custom_regions.empty()) {
+        if (opt.debug && (opt.layout == "auto" || opt.layout == "baseline") && opt.custom_regions.empty()) {
             const auto cut = lineforge_layout::find_cut(
-                mask, processed.width, LayoutRegion{0, 0, processed.width, processed.height}, processed.height);
+                mask, processed.width, LayoutRegion{0, 0, processed.width, processed.height}, processed.height,
+                opt.layout == "auto");
             std::cerr << "debug: gutter_pre_deskew="
                       << (pre_deskew_cut.found ? (pre_deskew_cut.vertical ? "vertical" : "horizontal") : "none")
                       << "[" << pre_deskew_cut.begin << "," << pre_deskew_cut.end << "] post_deskew="
@@ -1254,11 +1282,13 @@ int main(int argc, char** argv) {
             regions.push_back(LayoutRegion{0, 0, processed.width, processed.height});
         } else {
             regions = lineforge_layout::detect_regions(mask, processed.width, processed.height,
-                                                       opt.reading_order == "rtl");
+                                                       opt.reading_order == "rtl",
+                                                       opt.layout == "auto");
         }
 
         const auto crop_extents = find_gutter_crop_extents(
-            regions, processed.width, opt.custom_regions.empty() && opt.layout == "auto");
+            regions, processed.width, opt.custom_regions.empty() &&
+                (opt.layout == "auto" || opt.layout == "baseline"));
 
         std::vector<Band> bands;
         std::vector<size_t> lines_per_region(regions.size(), 0);
@@ -1266,10 +1296,15 @@ int main(int argc, char** argv) {
             const auto& r = regions[region_index];
             const int rw = r.x1 - r.x0, rh = r.y1 - r.y0;
             if (rw <= 0 || rh <= 0) continue;
-            std::vector<uint8_t> local_mask(static_cast<size_t>(rw) * rh);
+            std::vector<uint8_t> local_mask(static_cast<size_t>(rw) * rh, 0);
             for (int y = 0; y < rh; ++y) {
-                const auto source = mask.begin() + static_cast<size_t>(r.y0 + y) * processed.width + r.x0;
-                std::copy_n(source, rw, local_mask.begin() + static_cast<size_t>(y) * rw);
+                const int page_y = r.y0 + y;
+                const int row_left = lineforge_layout::left_at(r, page_y);
+                const int row_right = lineforge_layout::right_at(r, page_y);
+                const int copy_width = std::max(0, row_right - row_left);
+                const auto source = mask.begin() + static_cast<size_t>(page_y) * processed.width + row_left;
+                std::copy_n(source, copy_width,
+                    local_mask.begin() + static_cast<size_t>(y) * rw + (row_left - r.x0));
             }
             auto local_bands = find_bands(local_mask, rw, rh, opt.debug);
             for (auto& b : local_bands) {
@@ -1280,6 +1315,26 @@ int main(int argc, char** argv) {
                 b.region_x1 = r.x1;
                 b.gutter_crop_x0 = crop_extents[region_index].gutter_left_x;
                 b.gutter_crop_x1 = crop_extents[region_index].gutter_right_x;
+                if (r.curved_left || r.curved_right) {
+                    const int first = std::clamp(b.y0 - r.y0, 0, rh - 1);
+                    const int last = std::clamp(b.y1 - r.y0, first, rh - 1);
+                    if (r.curved_left) {
+                        int seam = std::numeric_limits<int>::max();
+                        for (int y = first; y <= last; ++y)
+                            seam = std::min(seam, r.left_by_row[static_cast<size_t>(y)]);
+                        b.region_x0 = r.left_by_row[static_cast<size_t>((first + last) / 2)];
+                        b.gutter_crop_x0 = seam;
+                    }
+                    if (r.curved_right) {
+                        int seam = std::numeric_limits<int>::min();
+                        for (int y = first; y <= last; ++y)
+                            seam = std::max(seam, r.right_by_row[static_cast<size_t>(y)]);
+                        b.region_x1 = r.right_by_row[static_cast<size_t>((first + last) / 2)];
+                        b.gutter_crop_x1 = seam - 1;
+                    }
+                    if (r.seam_confidence < 0.98)
+                        b.review_reasons.emplace_back("curved_layout_boundary_uncertainty");
+                }
             }
             lines_per_region[region_index] = local_bands.size();
             bands.insert(bands.end(), local_bands.begin(), local_bands.end());
@@ -1320,28 +1375,62 @@ int main(int argc, char** argv) {
         manifest << "  \"image_size\": {\"width\": " << processed.width << ", \"height\": " << processed.height << "},\n";
         manifest << "  \"deskew_correction_degrees\": " << std::fixed << std::setprecision(3) << angle << ",\n";
         manifest << "  \"layout\": {\"mode\": \"" << layout_name << "\", \"reading_order\": \""
-                 << reading_order_name << "\", \"regions\": [";
+                 << reading_order_name << "\", \"hierarchy\": \"page>layout_region>line\", \"regions\": [";
         for (size_t i = 0; i < regions.size(); ++i) {
             const auto& r = regions[i];
             if (i) manifest << ", ";
             manifest << "{\"id\": " << i + 1 << ", \"bbox_xyxy\": [" << r.x0 << ", " << r.y0
-                     << ", " << r.x1 << ", " << r.y1 << "], \"detected_lines\": "
-                     << lines_per_region[i] << "}";
+                     << ", " << r.x1 << ", " << r.y1 << "], \"parent_id\": 0, \"reading_order_index\": "
+                     << i + 1 << ", \"next_region_id\": ";
+            if (i + 1 < regions.size()) manifest << i + 2;
+            else manifest << "null";
+            manifest << ", \"geometry\": \""
+                     << ((r.curved_left || r.curved_right) ? "piecewise_vertical_boundary" : "axis_aligned")
+                     << "\", \"detected_lines\": " << lines_per_region[i];
+            const int sample_step = std::max(1, (r.y1 - r.y0) / 32);
+            for (const bool left_edge : {true, false}) {
+                const bool curved_edge = left_edge ? r.curved_left : r.curved_right;
+                if (!curved_edge) continue;
+                manifest << (left_edge ? ", \"left_edge_xy\": [" : ", \"right_edge_xy\": [");
+                bool first_point = true;
+                for (int y = r.y0; y < r.y1; y += sample_step) {
+                    if (!first_point) manifest << ", ";
+                    first_point = false;
+                    manifest << "[" << (left_edge ? lineforge_layout::left_at(r, y)
+                                                  : lineforge_layout::right_at(r, y))
+                             << ", " << y << "]";
+                }
+                const int last_y = r.y1 - 1;
+                if (last_y >= r.y0 && (last_y - r.y0) % sample_step != 0) {
+                    if (!first_point) manifest << ", ";
+                    manifest << "[" << (left_edge ? lineforge_layout::left_at(r, last_y)
+                                                  : lineforge_layout::right_at(r, last_y))
+                             << ", " << last_y << "]";
+                }
+                manifest << "]";
+            }
+            manifest << "}";
         }
-        manifest << "]},\n  \"page_number_filter\": \"conservative geometric heuristic; manually review\",\n  \"lines\": [\n";
+        manifest << "], \"fallback\": \"--layout baseline disables curved-seam search\"},\n"
+                 << "  \"page_number_filter\": \"conservative geometric heuristic; manually review\",\n"
+                 << "  \"lines\": [\n";
         size_t kept = 0, skipped = 0;
         for (const auto& b : bands) {
             if (b.page_number || b.non_text_fragment) { ++skipped; continue; }
             const std::string name = "line_" + (kept + 1 < 10 ? std::string("000") : kept + 1 < 100 ? std::string("00") : kept + 1 < 1000 ? std::string("0") : std::string()) + std::to_string(kept + 1) + ".png";
             std::array<int, 4> source_crop_bbox{};
             Image crop = crop_with_white_padding(processed, b, &source_crop_bbox);
+            if (b.region > 0 && static_cast<size_t>(b.region) <= regions.size())
+                mask_crop_to_curved_region(crop, regions[static_cast<size_t>(b.region - 1)], source_crop_bbox);
             write_png_gray(fs::path(opt.output) / name, crop);
             if (kept) manifest << ",\n";
             manifest << "    {\"file\": \"" << name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
                      << "], \"source_crop_bbox_xyxy\": [" << source_crop_bbox[0] << ", " << source_crop_bbox[1]
                      << ", " << source_crop_bbox[2] << ", " << source_crop_bbox[3] << "], \"crop_size\": ["
                      << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
-                     << ", \"region\": " << b.region << ", \"review_required\": "
+                     << ", \"region\": " << b.region << ", \"parent_region_id\": " << b.region
+                     << ", \"reading_order_index\": " << kept + 1
+                     << ", \"relationship\": \"contained_by_region\", \"review_required\": "
                      << (b.review_reasons.empty() ? "false" : "true") << ", \"review_reasons\": [";
             for (size_t i = 0; i < b.review_reasons.size(); ++i) {
                 if (i) manifest << ", ";
@@ -1359,7 +1448,17 @@ int main(int argc, char** argv) {
             manifest << "{\"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
                      << "], \"reason\": \"" << reason << "\", \"review\": true, \"review_required\": true, \"region\": " << b.region << "}";
         }
-        manifest << "],\n  \"detected_bands\": " << bands.size() << "\n}\n";
+        const auto report_time = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        manifest << "],\n  \"timing_ms\": {\"decode\": " << elapsed_ms(begin, loaded)
+                 << ", \"threshold\": " << elapsed_ms(loaded, thresholded)
+                 << ", \"cleanup_and_deskew\": " << elapsed_ms(thresholded, deskewed)
+                 << ", \"segmentation\": " << elapsed_ms(deskewed, segmented)
+                 << ", \"output\": " << elapsed_ms(segmented, report_time)
+                 << ", \"total_before_manifest_finalize\": " << elapsed_ms(begin, report_time)
+                 << "},\n  \"detected_bands\": " << bands.size() << "\n}\n";
         manifest.close();
         require(manifest.good(), "failed while writing manifest");
         const auto end = std::chrono::steady_clock::now();

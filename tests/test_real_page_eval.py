@@ -110,6 +110,44 @@ class RealPageEvaluatorTests(unittest.TestCase):
         self.assertTrue(result["page_has_segmentation_error"])
         self.assertTrue(result["page_has_review_alert"])
 
+    def test_word_region_order_review_and_runtime_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "lines": [
+                    {"bbox_xyxy": [10, 10, 30, 20], "source_crop_bbox_xyxy": [9, 9, 31, 21],
+                     "region": 1, "review_required": True, "review_reasons": ["edge_uncertain"]},
+                    {"bbox_xyxy": [10, 40, 30, 50], "source_crop_bbox_xyxy": [9, 39, 31, 51],
+                     "region": 2, "review_required": False},
+                ],
+                "layout": {"regions": [
+                    {"id": 1, "bbox_xyxy": [0, 0, 35, 30],
+                     "left_edge_xy": [[8, 0], [12, 30]], "right_edge_xy": [[35, 0], [35, 30]]},
+                    {"id": 2, "bbox_xyxy": [0, 30, 35, 60]},
+                ]},
+                "excluded": [], "timing_ms": {"total_before_manifest_finalize": 12.5},
+            }), encoding="utf-8")
+            result = evaluate_page({
+                "manifest": "manifest.json",
+                "ground_truth_xyxy": [[10, 10, 30, 20], [10, 40, 30, 50]],
+                "ground_truth_words_xyxy": [
+                    {"line_index": 0, "bbox_xyxy": [12, 12, 20, 18]},
+                    {"line_index": 1, "bbox_xyxy": [10, 41, 40, 48]},
+                ],
+                "ground_truth_regions": {"body": [0, 0, 40, 60]},
+                "ground_truth_region_ids": ["body", "body"],
+                "ground_truth_order": [1, 0],
+            }, root, 0.5)
+        self.assertEqual(result["retained_words"], 1)
+        self.assertEqual(result["clipped_or_unassigned_words"], 1)
+        self.assertEqual(result["region_assignment_errors"], 0)
+        self.assertEqual(result["region_assignment_accuracy"], 1.0)
+        self.assertEqual(result["reading_order"]["pairwise_order_violations"], 1)
+        self.assertEqual(result["reading_order"]["pairwise_order_accuracy"], 0.0)
+        self.assertEqual(result["review_reason_counts"], {"edge_uncertain": 1})
+        self.assertEqual(result["runtime_ms"], 12.5)
+
     def test_clean_unflagged_page_has_no_crop_error_denominator(self):
         result = self.evaluate([[10, 10, 100, 30]], [[10, 10, 100, 30]])
         self.assertEqual(result["review_candidate_rate"], 0.0)

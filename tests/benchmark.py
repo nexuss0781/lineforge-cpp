@@ -399,14 +399,12 @@ def run_heading_underline_case(binary, work):
     first_body = next((b for b in lines if 220 <= b["bbox_xyxy"][1] <= 280), None)
     mark_retained = False
     if first_body:
-        x0, y0, x1, y1 = first_body["bbox_xyxy"]
-        box_h = y1 - y0 + 1
-        pad_x = max(4, round(box_h * 0.18))
-        pad_y = max(3, round(box_h * 0.55))
-        border = max(2, round(box_h * 0.10))
-        crop_x, crop_y = x0 - pad_x - border, y0 - pad_y - border
+        x0, y0, x1, y1 = first_body["source_crop_bbox_xyxy"]
         crop = Image.open(out / first_body["file"]).convert("L")
-        dot_region = crop.crop((112 - crop_x, 233 - crop_y, 114 - crop_x, 235 - crop_y))
+        border_x = (crop.width - (x1 - x0)) // 2
+        border_y = (crop.height - (y1 - y0)) // 2
+        dot_region = crop.crop((112 - x0 + border_x, 233 - y0 + border_y,
+                                114 - x0 + border_x, 235 - y0 + border_y))
         mark_retained = dot_region.getextrema()[0] < 100
     separate_underline_crop = any(
         b["bbox_xyxy"][1] >= 125 and b["bbox_xyxy"][3] <= 140 and
@@ -460,7 +458,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.4.1" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 0.5.0" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -710,6 +708,243 @@ def run_bad_custom_region_case(binary, work):
             "checks": {"out_of_bounds_region_rejected": ok}, "elapsed_ms": round(elapsed_ms, 2)}
 
 
+def _font(size=24, bold=False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    path = f"/usr/share/fonts/truetype/dejavu/{name}"
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _draw_annotated_phrase(image, draw, font, left, right, y, seed):
+    phrases = ("IRREGULAR LAYOUT READING ORDER  ", "CONSERVATIVE TEXT BLOCK GEOMETRY  ",
+               "COLUMN CONTENT REMAINS COMPLETE  ")
+    text = phrases[seed % len(phrases)]
+    while draw.textlength(text, font=font) < right - left:
+        text += phrases[seed % len(phrases)]
+    while text and draw.textlength(text, font=font) > right - left:
+        text = text[:-1]
+    draw.text((left, y), text, font=font, fill=10)
+    box = draw.textbbox((left, y), text, font=font)
+    sample = image.crop(box)
+    actual = ImageChops.difference(sample, Image.new("L", sample.size, 255)).getbbox()
+    return (box[0] + actual[0], box[1] + actual[1],
+            box[0] + actual[2], box[1] + actual[3]) if actual else box
+
+
+def make_curved_gutter_fixture(path):
+    """A spanning headline over two text columns split by a smooth curved gutter."""
+    im = Image.new("L", (1200, 1100), 255)
+    draw = ImageDraw.Draw(im)
+    title_font, font = _font(32, True), _font(23)
+    title = "SPANNING HEADLINE OVER CURVED NEWSPAPER COLUMNS"
+    draw.text((90, 65), title, font=title_font, fill=10)
+    title_box = draw.textbbox((90, 65), title, font=title_font)
+    labels = [("title", title_box)]
+    ys = (220, 350, 480, 610, 740, 870)
+    for i, y in enumerate(ys):
+        gutter = 600 + round(82 * math.sin((y - 220) * 2 * math.pi / 720))
+        labels.append(("left", _draw_annotated_phrase(im, draw, font, 65, gutter - 48, y, i)))
+        labels.append(("right", _draw_annotated_phrase(im, draw, font, gutter + 48, 1135, y, i + 1)))
+    im.save(path, "PNG")
+    return labels
+
+
+def run_curved_layout_case(binary, work):
+    source, out = work / "layout_curved_gutter.png", work / "out_layout_curved_gutter"
+    labels = make_curved_gutter_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out), "--no-deskew"],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "layout_curved_partial_gutter", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    regions = manifest["layout"]["regions"]
+    geometry = any(r.get("geometry") == "piecewise_vertical_boundary" for r in regions)
+    timing = manifest.get("timing_ms", {})
+    timing_keys = ("decode", "threshold", "cleanup_and_deskew", "segmentation", "output",
+                   "total_before_manifest_finalize")
+    order_ok = len(lines) == 13
+    if order_ok:
+        centers = [(b["bbox_xyxy"][0] + b["bbox_xyxy"][2]) / 2 for b in lines]
+        order_ok = centers[0] > 450 and centers[0] < 750 and all(x < 600 for x in centers[1:7]) and \
+                   all(x >= 600 for x in centers[7:13])
+    retained = 0
+    for side, box in labels:
+        x0, y0, x1, y1 = box
+        expected_center_x, expected_center_y = (x0 + x1) / 2, (y0 + y1) / 2
+        candidates = [line for line in lines
+                      if abs((line["bbox_xyxy"][1] + line["bbox_xyxy"][3]) / 2 - expected_center_y) < 50 and
+                      (side == "title" or (((line["bbox_xyxy"][0] + line["bbox_xyxy"][2]) / 2 < 600) == (side == "left")))]
+        retained += any(line["source_crop_bbox_xyxy"][0] <= x0 and line["source_crop_bbox_xyxy"][1] <= y0 and
+                        line["source_crop_bbox_xyxy"][2] >= x1 and line["source_crop_bbox_xyxy"][3] >= y1
+                        for line in candidates)
+    checks = {"spanning_title_preserved": bool(lines) and lines[0]["bbox_xyxy"][0] < 300 < lines[0]["bbox_xyxy"][2],
+              "curved_separator_reported": geometry,
+              "thirteen_blocks_lines_detected": len(lines) == 13,
+              "column_major_order_after_spanning_block": order_ok,
+              "all_independent_line_ink_boxes_inside_crops": retained == len(labels),
+              "stage_runtime_reported": all(isinstance(timing.get(key), (int, float)) and timing[key] >= 0
+                                             for key in timing_keys),
+              "region_relations_emitted": all("reading_order_index" in r and "parent_id" in r for r in regions)}
+    return {"case": "layout_curved_partial_gutter", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "region_count": len(regions), "retained_source_boxes": retained}
+
+
+def run_baseline_fallback_case(binary, work):
+    source, out = work / "layout_curved_gutter.png", work / "out_layout_curved_baseline"
+    make_curved_gutter_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out),
+                           "--layout", "baseline", "--no-deskew"],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "layout_baseline_fallback", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    regions = manifest["layout"]["regions"]
+    checks = {"baseline_mode_reported": manifest["layout"]["mode"] == "baseline",
+              "curved_edges_disabled": all(r.get("geometry") != "piecewise_vertical_boundary" for r in regions),
+              "legacy_rows_remain_usable": 7 <= len(manifest["lines"]) <= 13}
+    return {"case": "layout_baseline_fallback", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(manifest["lines"]), "region_count": len(regions)}
+
+
+def make_curved_baseline_fixture(path):
+    """Word-level glyph placements follow a slowly undulating writing baseline."""
+    im = Image.new("L", (1200, 1050), 250)
+    draw = ImageDraw.Draw(im)
+    font = _font(25)
+    rng = random.Random(4107)
+    labels = []
+    words = ("Curved", "writing", "baseline", "keeps", "every", "word", "intact")
+    for row, base in enumerate((130, 300, 470, 640, 810)):
+        x = 100
+        row_boxes = []
+        for i, word in enumerate(words):
+            y = base + round(17 * math.sin((x - 100) / 175 + row * 0.31)) + rng.randint(-1, 1)
+            draw.text((x, y), word, font=font, fill=12)
+            box = draw.textbbox((x, y), word, font=font)
+            rendered = im.crop(box)
+            actual = ImageChops.difference(rendered, Image.new("L", rendered.size, 255)).getbbox()
+            if actual:
+                box = (box[0] + actual[0], box[1] + actual[1],
+                       box[0] + actual[2], box[1] + actual[3])
+            row_boxes.append(box)
+            x += int(draw.textlength(word, font=font)) + 28
+        labels.append((min(b[0] for b in row_boxes), min(b[1] for b in row_boxes),
+                       max(b[2] for b in row_boxes), max(b[3] for b in row_boxes)))
+    im.save(path, "PNG")
+    return labels
+
+
+def run_curved_baseline_case(binary, work):
+    source, out = work / "curved_baselines.png", work / "out_curved_baselines"
+    labels = make_curved_baseline_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out), "--no-deskew"],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "curved_variable_baselines", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    retained = sum(any(line["source_crop_bbox_xyxy"][0] <= x0 and line["source_crop_bbox_xyxy"][1] <= y0 and
+                       line["source_crop_bbox_xyxy"][2] >= x1 and line["source_crop_bbox_xyxy"][3] >= y1
+                       and abs((line["bbox_xyxy"][1] + line["bbox_xyxy"][3]) / 2 - (y0 + y1) / 2) < 45
+                       for line in lines) for x0, y0, x1, y1 in labels)
+    checks = {"five_wavy_lines_detected": len(lines) == 5,
+              "all_independent_word_ink_envelopes_retained": retained == len(labels),
+              "reading_order_monotonic": [b["bbox_xyxy"][1] for b in lines] == sorted(b["bbox_xyxy"][1] for b in lines)}
+    return {"case": "curved_variable_baselines", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "retained_source_boxes": retained}
+
+
+def make_workbook_fixture(path):
+    """Mixed printed questions and hand-drawn-like answer strokes in ruled rows."""
+    im = Image.new("L", (1200, 1100), 255)
+    draw = ImageDraw.Draw(im)
+    printed = _font(27)
+    rng = random.Random(721)
+    labels = []
+    answer_ink = []
+    for row, y in enumerate((150, 430, 710)):
+        text = f"Exercise {row + 1}: solve the problem and show your work"
+        draw.text((95, y), text, font=printed, fill=12)
+        labels.append(draw.textbbox((95, y), text, font=printed))
+        # A variable, jittered stroke sequence stands in for handwriting-like geometry.
+        x0 = 140
+        for i in range(9):
+            x = x0 + i * 78
+            base = y + 72 + rng.randint(-4, 4)
+            height = rng.randint(18, 32)
+            points = (x, base - height, x + rng.randint(9, 18), base - height // 2,
+                      x + rng.randint(18, 30), base)
+            stroke_width = rng.randint(2, 4)
+            draw.line(points, fill=22, width=stroke_width)
+            candidate = (x - 4, base - height - 4, x + 35, base + 5)
+            ink_crop = im.crop(candidate)
+            actual = ImageChops.difference(ink_crop, Image.new("L", ink_crop.size, 255)).getbbox()
+            if actual:
+                answer_ink.append((candidate[0] + actual[0], candidate[1] + actual[1],
+                                   candidate[0] + actual[2], candidate[1] + actual[3]))
+            if i % 2 == 0:
+                ellipse = (x + 24, base - height, x + 42, base - 4)
+                draw.ellipse(ellipse, outline=22, width=2)
+                ink_crop = im.crop((ellipse[0] - 3, ellipse[1] - 3, ellipse[2] + 4, ellipse[3] + 4))
+                actual = ImageChops.difference(ink_crop, Image.new("L", ink_crop.size, 255)).getbbox()
+                if actual:
+                    answer_ink.append((ellipse[0] - 3 + actual[0], ellipse[1] - 3 + actual[1],
+                                       ellipse[0] - 3 + actual[2], ellipse[1] - 3 + actual[3]))
+        # Thin answer/table rules are deliberately distinct from the ink words.
+        draw.line((75, y + 112, 1125, y + 112), fill=35, width=2)
+    draw.line((75, 125, 75, 865), fill=50, width=2)
+    draw.line((1125, 125, 1125, 865), fill=50, width=2)
+    im.save(path, "PNG")
+    return {"prompts": labels, "answer_ink": answer_ink}
+
+
+def run_workbook_case(binary, work):
+    source, out = work / "exercise_workbook.png", work / "out_exercise_workbook"
+    labels = make_workbook_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "workbook_mixed_content", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    prompt_covered = sum(any(line["source_crop_bbox_xyxy"][0] <= box[0] and line["source_crop_bbox_xyxy"][1] <= box[1] and
+                             line["source_crop_bbox_xyxy"][2] >= box[2] and line["source_crop_bbox_xyxy"][3] >= box[3]
+                             for line in lines) for box in labels["prompts"])
+    answer_ink_covered = sum(any(line["source_crop_bbox_xyxy"][0] <= box[0] and line["source_crop_bbox_xyxy"][1] <= box[1] and
+                                 line["source_crop_bbox_xyxy"][2] >= box[2] and line["source_crop_bbox_xyxy"][3] >= box[3]
+                                 for line in lines) for box in labels["answer_ink"])
+    rule_crops = [line for line in lines if line["bbox_xyxy"][2] - line["bbox_xyxy"][0] > 300 and
+                  line["bbox_xyxy"][3] - line["bbox_xyxy"][1] <= 7]
+    checks = {"all_three_printed_prompts_preserved": prompt_covered == 3,
+              "all_handwriting_like_answer_strokes_retained": answer_ink_covered == len(labels["answer_ink"]),
+              "work_rows_not_collapsed_into_one_page_crop": 3 <= len(lines) <= 9,
+              "thin_answer_rules_not_emitted_as_text": not rule_crops,
+              "crop_and_region_relationships_reported": all("region" in line and "reading_order_index" in line for line in lines),
+              "review_candidates_still_visible": isinstance(manifest["excluded"], list)}
+    return {"case": "workbook_mixed_content", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "excluded_count": len(manifest["excluded"]),
+            "answer_ink_groups": len(labels["answer_ink"]), "retained_answer_ink_groups": answer_ink_covered}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True, type=Path)
@@ -736,7 +971,11 @@ def main():
                        run_gutter_margin_case(args.binary.resolve(), work),
                        run_custom_region_case(args.binary.resolve(), work),
                        run_single_layout_case(args.binary.resolve(), work),
-                       run_bad_custom_region_case(args.binary.resolve(), work)))
+                       run_bad_custom_region_case(args.binary.resolve(), work),
+                       run_curved_layout_case(args.binary.resolve(), work),
+                       run_baseline_fallback_case(args.binary.resolve(), work),
+                       run_curved_baseline_case(args.binary.resolve(), work),
+                       run_workbook_case(args.binary.resolve(), work)))
     else:
         with tempfile.TemporaryDirectory(prefix="lineforge-bench-") as tmp:
             work = Path(tmp)
@@ -756,7 +995,11 @@ def main():
                            run_gutter_margin_case(args.binary.resolve(), work),
                            run_custom_region_case(args.binary.resolve(), work),
                            run_single_layout_case(args.binary.resolve(), work),
-                           run_bad_custom_region_case(args.binary.resolve(), work)))
+                           run_bad_custom_region_case(args.binary.resolve(), work),
+                           run_curved_layout_case(args.binary.resolve(), work),
+                           run_baseline_fallback_case(args.binary.resolve(), work),
+                           run_curved_baseline_case(args.binary.resolve(), work),
+                           run_workbook_case(args.binary.resolve(), work)))
     timings = [r["elapsed_ms"] for r in results]
     report = {
         "benchmark": "synthetic line-segmentation geometry",

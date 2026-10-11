@@ -1,4 +1,5 @@
 build/
+build-sanitize/
 cmake-build-*/
 .venv/
 benchmark-output/
