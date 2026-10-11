@@ -6,15 +6,18 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw, ImageFont
 
-from scripts.ntf_lineforge_dataset import (
+from scripts.lineforge_dataset import (
+    dispatch_local_run,
     QuotaLedger,
     assign_pdf_shards,
     crop_acceptance_reason,
     middle_page_order,
     monitor_local_workers,
+    require_hf_token,
     reduce_worker_results,
     sha256_file,
     validate_source_manifest,
@@ -23,6 +26,15 @@ from scripts.ntf_lineforge_dataset import (
 
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class HuggingFaceTokenTests(unittest.TestCase):
+    def test_token_is_required_and_read_from_hf_token_environment_variable(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "HF_TOKEN"):
+                require_hf_token()
+        with patch.dict("os.environ", {"HF_TOKEN": "  test-token-not-real  "}, clear=True):
+            self.assertEqual(require_hf_token(), "test-token-not-real")
 
 
 def make_crop(path: Path, kind: str = "text", tag: int = 0) -> None:
@@ -47,11 +59,13 @@ def make_crop(path: Path, kind: str = "text", tag: int = 0) -> None:
 def make_record(shard_id: int, page: int = 10, line_index: int = 1, pdf_hash: str | None = None) -> dict:
     return {
         "source_pdf_sha256": pdf_hash or digest(f"pdf-{shard_id}-{page}-{line_index}"),
+        "source_pdf_id": f"private-pdf-{shard_id}",
         "page_number": page,
         "line_index": line_index,
         "shard_id": shard_id,
         "engine_version": "lineforge-1.0.1",
         "source_license": "CC0-1.0",
+        "rights_evidence_ref": "private-fixture-rights-record",
     }
 
 
@@ -76,6 +90,9 @@ class ManifestTests(unittest.TestCase):
                 }],
             }
             self.assertEqual(len(validate_source_manifest(base, root)), 1)
+            self.assertEqual(len(validate_source_manifest(base, root, allowed_root=root)), 1)
+            with self.assertRaisesRegex(ValueError, "outside the approved source root"):
+                validate_source_manifest(base, root, allowed_root=root / "different-root")
             bad_status = json.loads(json.dumps(base))
             bad_status["files"][0]["status"] = False
             with self.assertRaisesRegex(ValueError, "Status=true"):
@@ -233,6 +250,8 @@ class QuotaAndReducerTests(unittest.TestCase):
                 self.assertTrue(image["source_pdf_sha256"])
                 self.assertTrue(image["engine_version"])
                 self.assertEqual(image["source_license"], "CC0-1.0")
+                self.assertTrue(image["source_pdf_id"])
+                self.assertEqual(image["rights_evidence_ref"], "private-fixture-rights-record")
                 self.assertTrue((root / "dataset" / image["relative_path"]).is_file())
             self.assertTrue(final_path.is_file())
 
@@ -295,6 +314,82 @@ class QuotaAndReducerTests(unittest.TestCase):
             worker_path.write_text(json.dumps(worker), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "different deterministic run seeds"):
                 reduce_worker_results(result_dir, ledger, "run-health", manifest_sha, 1, root / "out.json")
+
+
+class DispatcherIntegrationTests(unittest.TestCase):
+    def test_dispatch_starts_19_workers_and_coordinator_and_collects_exact_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_root = root / "private-source"
+            source_root.mkdir()
+            pages = []
+            for page_number in range(1, 13):
+                page = Image.new("RGB", (300, 200), "white")
+                ImageDraw.Draw(page).text((20, 40), f"Synthetic page {page_number}", fill="black")
+                pages.append(page)
+            pdf_path = source_root / "sample.pdf"
+            pages[0].save(pdf_path, "PDF", save_all=True, append_images=pages[1:], resolution=100)
+            manifest = {
+                "schema_version": 1,
+                "dataset_id": "private-integration-fixture",
+                "revision": "fixture-r1",
+                "files": [{
+                    "pdf_id": "private-book-1",
+                    "pdf_sha256": sha256_file(pdf_path),
+                    "path": "sample.pdf",
+                    "page_count": 12,
+                    "status": True,
+                    "redistribution": {
+                        "allowed": True,
+                        "license": "CC0-1.0",
+                        "evidence_ref": "private-fixture-rights-record",
+                    },
+                }],
+            }
+            manifest_path = source_root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            fake_linecrop = root / "fake-linecrop"
+            fake_linecrop.write_text(
+                "#!/usr/bin/env python3\n"
+                "import argparse, json\n"
+                "from pathlib import Path\n"
+                "from PIL import Image, ImageDraw\n"
+                "p=argparse.ArgumentParser()\n"
+                "p.add_argument('--input'); p.add_argument('--output'); p.add_argument('--layout')\n"
+                "a=p.parse_args()\n"
+                "out=Path(a.output); out.mkdir(parents=True, exist_ok=True)\n"
+                "page=int(Path(a.input).parent.name.split('-')[-1])\n"
+                "im=Image.new('RGB',(420,84),'white'); d=ImageDraw.Draw(im)\n"
+                "for y in range(20,62,5):\n"
+                "  for x in range(10+page%11,400,19): d.line((x,y,x+7,y+2),fill='black',width=2)\n"
+                "im.save(out/'line_0001.png')\n"
+                "(out/'manifest.json').write_text(json.dumps({'version':'test-lineforge','lines':[{'file':'line_0001.png','review_required':False,'review_reasons':[]}] }))\n",
+                encoding="utf-8",
+            )
+            fake_linecrop.chmod(0o755)
+            run_dir = root / "run-1"
+            result = dispatch_local_run(
+                input_manifest=manifest_path,
+                source_root=source_root,
+                run_dir=run_dir,
+                run_seed="integration-seed",
+                run_id="integration-run-1",
+                linecrop_binary=fake_linecrop,
+                target=2,
+                poll_seconds=1,
+                timeout_seconds=90,
+            )
+            self.assertEqual(result["worker_count"], 19)
+            self.assertEqual(result["coordinator_count"], 1)
+            self.assertEqual(result["image_count"], 2)
+            self.assertFalse(result["publishable"])
+            self.assertEqual(len(list((run_dir / "dataset" / "workers").glob("worker-*.json"))), 19)
+            self.assertTrue((run_dir / "dataset-manifest.json").is_file())
+            with self.assertRaises(FileExistsError):
+                dispatch_local_run(
+                    manifest_path, source_root, run_dir, "integration-seed", "integration-run-2",
+                    fake_linecrop, target=2, poll_seconds=1, timeout_seconds=5,
+                )
 
 
 if __name__ == "__main__":
