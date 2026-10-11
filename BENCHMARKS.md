@@ -1,11 +1,30 @@
 # Benchmark and validation record
 
-**Run date:** 2026-10-11
-**Engine:** `linecrop 0.5.0`
+**Latest audit date:** 2026-10-11
+**Current engine:** `linecrop 1.0.0`
 **Build:** Release, GCC 13.3.0, CMake, Ubuntu 24.04
-**Comparison baseline:** `3ac462cd4fe46373efa6637cecf979e17021cd12` (`linecrop 0.4.1`)
+**Pinned code baseline for the V1 rerun:** `15fc0b878445f98fad01b38e1dfc861ac4bd464c` (`linecrop 0.5.0`)
+**Historical 0.5.0 comparison baseline:** `3ac462cd4fe46373efa6637cecf979e17021cd12` (`linecrop 0.4.1`)
 
-## 0.5.0 geometry-aware release audit
+## 1.0.0 V1 line and crop-retention audit
+
+| Validation | Result | Scope and qualification |
+| --- | --- | --- |
+| Release build and CTest | **2/2 passed** | Includes the full **49-case synthetic suite** and **13 evaluator unit tests**. |
+| AddressSanitizer/UndefinedBehaviorSanitizer CTest | **2/2 passed** | Leak detection and halt-on-error enabled; full synthetic suite plus evaluator unit tests. |
+| Faint/shallow synthetic retention | **3,553/3,553 source-ink pixels retained** in the recoverable case | A separate lower-contrast case remains review-flagged; synthetic evidence is not a real-scan accuracy claim. |
+| Exact spread-39 rerun, 3300×2556 | **52 crops, 2 page regions, 0 centerline-crossing crops** | Physical-side crop counts are 30 left / 22 right in both LTR and RTL runs. No independently corrected line labels exist for this spread, so these are geometry counts, not precision/recall. |
+| Spread-39 `line_0052` crop-edge defect | **Repaired and review-flagged** | Pinned 0.5.0 assigned a 14-pixel crop to source ink spanning 39 active rows. V1 expands the line/crop to 54 pixels, retains that full vertical source span, and records `shallow_candidate_expanded_from_local_ink`. |
+| Exact brown page-26 raster comparison | **33 crops + 1 excluded candidate in both 0.5.0 and 1.0.0** | Historical 0.2.0 emitted 27 crops, including boxes spanning 244 and 128 pixels in dense text regions. V1 adds shallow-candidate review flags and expands one short interior row; this raster has no independent line labels, so counts are not accuracy or proven merges. |
+| Existing independent ROI labels, same inputs and labels | **31/32 matches for both pinned 0.5.0 and V1**; precision **1.000**, recall **0.9688** | Five selected ROIs from private scans; one missed line and two evaluator merge indicators on page 43. The crop-level review recall for those two indicators is **0/2**; a page-level excluded-candidate alert is not proof that the exact crop errors were detected. No word/ink boxes are present in this label set, so word-edge retention is unscored. |
+| Source-crop retention against labeled line boxes | **95.19% mean area coverage; 19/32 fully contained** | Label-box geometry, not exact glyph segmentation. Left/right edges retained for 31/32 boxes; top for 24/32 and bottom for 26/32. |
+| Reading-order labels | **0/94 pairwise violations** | Across the available labeled ROI order annotations; this does not score left/right accuracy on spread 39. |
+| Five-page labeled-run timing | **294.757 ms mean; 251.831 ms median; 544.234 ms p95** | Five observations only; nearest-rank p95 therefore equals the slowest observed page. Timing is environment-specific, not a throughput guarantee. |
+| Additional real-page smoke runs | **Seven source rasters from two private PDFs completed**, plus the separate spread and brown-26 tests | Unlabeled pages are smoke/geometry checks only. No broad, independently labeled handwriting or workbook corpus was available. |
+
+The five-page V1 ROI result matches a fresh build of the pinned public 0.5.0 commit on the same available rasters and labels. A separate older local metrics JSON reported 32/32 on a similarly sized set, but that result was not reproducible with the pinned public baseline and currently available source images, so it is not carried forward as a V1 accuracy claim. No universal or perfect-accuracy claim is made. Private PDFs, rasters, crops, overlays, and annotations remain outside Git.
+
+## Historical 0.5.0 geometry-aware release audit
 
 | Validation | Result | Scope and qualification |
 | --- | --- | --- |
@@ -58,7 +77,7 @@ The 0.5.0 result is a strong pass on this small, selected sample—not a univers
 | Full private-PDF corpus, baseline | **361 pages**, 12,452 kept crop candidates, 1,573 kept crops flagged, 508 excluded candidates | Two documents: 83 and 278 pages. Candidate and flag counts are workload measures, not ground-truth accuracy. |
 | Full private-PDF corpus, 0.4.0 | **361 pages**, 12,816 kept crop candidates, 806 kept crops flagged, 514 excluded candidates | Same locally rasterized pages and 1,200-pixel rendering setting as baseline. The new detector emitted 364 more candidates (+2.9%). |
 
-## 0.4.1 vertical-boundary audit
+## Historical 0.4.1 vertical-boundary audit
 
 The focused audit used the same 23 independently labeled line boxes across four selected ROIs on four real pages from two scanned documents. It compared the local 0.4.0 baseline with 0.4.1 using the evaluator's one-to-one IoU matches, then scored each matched top and bottom edge separately. The labels cover scan-A pages 25, 26, and 43, plus scan-B page 2; they are a small selected sample, not a claim about all pages or font sizes.
 
@@ -75,7 +94,7 @@ All 23 labels matched one emitted crop in both versions. The two remaining top-b
 
 The refined geometry changed only vertical boundaries and crop windows in the five compared runs. Kept-line counts, horizontal coordinates, review flags/reasons, and excluded-candidate boxes were identical to 0.4.0. Four sampled output crops from the brown page and page 43 were visually inspected: the updated crops no longer show fragments of the next row at their vertical edges, and no visible ascender/descender/mark clipping was found in those examples. This is a limited visual spot check, not a full-page guarantee. Private PDFs, images, crop outputs, overlays, and labels remain outside the repository.
 
-### Review-workload comparison
+### Historical 0.4.0 review-workload comparison
 
 Excluded candidates are counted as review work, rather than being discarded from the comparison.
 
@@ -89,7 +108,7 @@ Across the combined corpus, kept-crop review flags declined **48.8%** (1,573 →
 
 On emitted crops, the primary review-reason counts also fell: possible merged/oversized crops **719 → 420**, short/fragmentary crops **379 → 208**, and page-edge warnings **767 → 230**. Reasons may overlap on a crop. The full-corpus run has no line-level ground truth, so these decreases do not establish that every removed warning was unnecessary or that every true error was detected.
 
-## Independent held-out ROI evaluation
+## Historical 0.4.0 independent held-out ROI evaluation
 
 The four ROIs were selected on source-page rasters from two private documents. Line-row intervals were selected visually on source images and boxes were bounded from source pixels within those intervals; detector output was not used to create the labels. The evaluator uses one-to-one IoU matching at 0.50. Review workload counts `review_required` crops and excluded candidates inside each ROI. A wide crop covering multiple labeled lines is treated as a merge even when a short, indented line occupies little of that crop's area. Missed lines contribute to page-level segmentation-error recall, not crop-error recall.
 
@@ -103,7 +122,7 @@ The four ROIs were selected on source-page rasters from two private documents. L
 
 The two error-containing ROIs each had a review alert. The four unmatched labels and two false-positive predictions remain real errors in this sample; review flags expose uncertainty but do not fix segmentation. These four selected regions cannot support a general accuracy or recall claim. More independently annotated pages—especially covers, edge-truncated text, faint scans, and irregular columns—are needed for a stronger calibration set.
 
-## Synthetic coverage and reproducibility
+## Historical 0.4.1 synthetic coverage and reproducibility
 
 The 43 deterministic checks cover 24 generated pages across clean, low-contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font or pseudo-Ethiopic text (three seeds each); two blank-page rejection cases; a 15.55-megapixel throughput case; sparse row noise; close-pitch vertical rows; a four-font-size vertical-boundary/crop-isolation case; clipped top-edge text beside a dark scan-border stroke; heading/underline/detached-mark/speck/footer handling; four CLI/error-path cases; and seven layout cases. These tests check geometry, ordering, crop files, repair behavior, skew, reading order, and review metadata. They do not measure transcription or OCR accuracy.
 
@@ -117,7 +136,7 @@ ctest --test-dir build --output-on-failure
 
 The private source PDFs, raster pages, crop outputs, overlays, and annotation JSON are not in the repository. The full-corpus figures above are local workload comparisons and cannot be independently reproduced from public repository contents alone.
 
-## Changes exercised
+## Historical 0.4.0 changes exercised
 
 - Kept horizontal recursive whitespace/XY-cut layout intelligence, with columns and blocks identified before line rows.
 - Refined vertical line bands using region-local row profiles, low-density valleys, connected components, and observed local line spacing.
@@ -126,6 +145,6 @@ The private source PDFs, raster pages, crop outputs, overlays, and annotation JS
 - Made scale-based uncertainty checks local to each block and tightened fragment and edge flags using structural evidence.
 - Extended evaluation to report review workload, crop-error review recall, and error-page alert recall, including missed lines.
 
-## Limitations
+## Historical evaluation limitations
 
 Full-corpus candidate/flag counts are not an accuracy denominator. The earlier held-out hand-labeled evaluation covers only 36 lines in four selected ROIs; its observed 100% error recall is based on just two crop-error candidates and two affected ROIs, and must not be generalized. The new vertical-boundary audit covers only 23 unique lines; two top edges remain more than 3 px from their labels, so performance across all fonts, pages, and irregular layouts is not established. Decorative covers and irregular layouts remain high-noise; review flags and excluded candidates should still be inspected on such pages. PDFs and all derived images, crops, overlays, and labels remain private and were not committed.

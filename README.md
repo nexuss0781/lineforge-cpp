@@ -4,6 +4,13 @@ A fast, deterministic C++ command-line tool that turns scanned page images into 
 
 **This is a new project, not OCR-ALIGNER.** Public repository: [`nexuss0781/lineforge-cpp`](https://github.com/nexuss0781/lineforge-cpp).
 
+## V1.0.0: conservative line and crop recovery
+
+- Estimates glyph height from nearby rows inside each detected or explicitly supplied region. A suspiciously shallow candidate can expand only where dark-mask or locally faint grayscale evidence continues; short internal valleys allow detached marks without bridging a long blank gap.
+- Caps recovery by the local glyph scale and the midpoint to neighboring rows. Horizontal bounds and existing gutter caps are unchanged, so a vertical repair cannot widen a crop across a spread. Every automatically expanded candidate is review-flagged; broad, ink-bearing candidates that remain unusually shallow are flagged instead of silently trusted.
+- Applies the same evidence-based path to ordinary pages, columns, spreads, and custom regions; it does not recognize page IDs or hard-code a particular source scan. Unclear source detail remains a review case rather than an inferred repair.
+- Extends the independent evaluator with annotated line-box coverage, left/right word-edge retention, and optional per-side precision/recall and gutter-crossing metrics.
+
 ## Geometry-aware layout in 0.5.0
 
 - Uses a page → layout-region/block → line hierarchy. Regions carry stable IDs, parent/next relationships, reading-order indices, and geometry provenance in `manifest.json`; lines link to their containing region.
@@ -45,7 +52,7 @@ Outputs are `line_0001.png`, `line_0002.png`, … and `manifest.json`. The manif
 
 ## Validation
 
-`tests/benchmark.py` runs **48 deterministic synthetic checks** covering clean/degraded scans, blank pages, a 15.5-megapixel throughput case, row noise and dense rows, multiple font scales, clipped edge ink, detached marks, spreads and columns, a newspaper layout, gutter leakage, custom/fallback modes, a curved partial gutter with a spanning headline, undulating text baselines, and a workbook-style fixture with printed prompts, variable hand-drawn-like answer strokes, and ruled answer rows. The workbook fixture independently checks that all generated answer-stroke ink remains inside output crops and that long rules are not emitted as text. These are reproducible geometry stress tests, **not** a human-annotated accuracy benchmark, handwriting benchmark, or OCR evaluation.
+`tests/benchmark.py` runs **49 deterministic synthetic checks** covering clean/degraded scans, blank pages, a 15.5-megapixel throughput case, row noise and dense rows, multiple font scales, faint and shallow line edges with source-ink retention/review assertions, clipped edge ink, detached marks, spreads and columns, a newspaper layout, gutter leakage, custom/fallback modes, a curved partial gutter with a spanning headline, undulating text baselines, and a workbook-style fixture with printed prompts, variable hand-drawn-like answer strokes, and ruled answer rows. The workbook fixture independently checks that all generated answer-stroke ink remains inside output crops and that long rules are not emitted as text. These are reproducible geometry stress tests, **not** a human-annotated accuracy benchmark, handwriting benchmark, or OCR evaluation.
 
 A separate evaluator scores manifests against independent source annotations. Example:
 
@@ -55,7 +62,7 @@ python3 tests/real_page_eval.py \
   --output-json report.json
 ```
 
-The input JSON contains `iou_threshold` (default `0.5`) and a `pages` array. Each page supplies a manifest path and `ground_truth_xyxy` boxes; optional fields include `roi_xyxy`, source-word ink boxes, region boxes and line-to-region IDs, a ground-truth reading order, and review/runtime observations. The evaluator reports one-to-one IoU precision/recall, false positives, misses, cut/merged/split indicators, top/bottom boundary errors, source-word containment, region assignment, pairwise reading order, review workload/reasons, and runtime. Optional metrics are only meaningful when independently annotated. Excluded candidates do not count as emitted crops but do count toward review workload.
+The input JSON contains `iou_threshold` (default `0.5`) and a `pages` array. Each page supplies a manifest path and `ground_truth_xyxy` boxes; optional fields include `roi_xyxy`, source-word boxes, region boxes and line-to-region IDs, a ground-truth reading order, `side_split_x` for spread-specific left/right scoring, and review/runtime observations. The evaluator reports one-to-one IoU precision/recall, false positives, misses, cut/merged/split indicators, vertical boundary errors, annotated line-box coverage by source crops, word left/right-edge retention, region assignment, pairwise reading order, review workload/reasons, optional per-side precision/recall and gutter-crossing crops, and runtime. These geometric label-box metrics are only meaningful to the extent that their source annotations are independently corrected; they do not substitute for OCR or transcription scoring. Excluded candidates do not count as emitted crops but do count toward review workload.
 
 For any evaluation, label held-out source pages independently of detector output, review the source overlay, state the sample size and scope, and keep private scans, crops, overlays, and annotations out of version control.
 

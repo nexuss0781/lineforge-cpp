@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,15 @@ def as_box(value: list[int | float]) -> Box:
 
 def area(box: Box) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def nearest_rank_percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    if not 0 < quantile <= 1:
+        raise ValueError("quantile must be in (0, 1]")
+    ordered = sorted(values)
+    return ordered[math.ceil(quantile * len(ordered)) - 1]
 
 
 def intersection(a: Box, b: Box) -> float:
@@ -101,6 +111,102 @@ def order_summary(predicted_truth: list[int], truth_order: list[int]) -> dict[st
         "pairwise_order_violations": discordant,
         "exact_order": observed == [i for i in truth_order if i in set(observed)],
     }
+
+
+def geometric_side_metrics(split_x: float | None, truth: list[Box], predicted: list[Box],
+                           selected_items: list[dict[str, Any]], matches: list[dict[str, Any]],
+                           selected_excluded: list[dict[str, Any]],
+                           error_predictions: set[int], review_prediction_indices: set[int],
+                           flagged_error_predictions: set[int]) -> dict[str, Any] | None:
+    if split_x is None:
+        return None
+    side_of = lambda box: "left" if (box[0] + box[2]) / 2 < split_x else "right"
+    matched_truth_to_pred = {int(match["truth_index"]): int(match["prediction_index"])
+                             for match in matches}
+    matched_pred_to_truth = {prediction: truth_index
+                             for truth_index, prediction in matched_truth_to_pred.items()}
+    cross_side_matches = sum(
+        side_of(truth[truth_index]) != side_of(predicted[prediction])
+        for truth_index, prediction in matched_truth_to_pred.items()
+    )
+    crossing_by_side = {"left": 0, "right": 0}
+    for item, box in zip(selected_items, predicted):
+        source = as_box(item.get("source_crop_bbox_xyxy", item["bbox_xyxy"]))
+        if source[0] < split_x < source[2]:
+            crossing_by_side[side_of(box)] += 1
+    excluded_reviews = {"left": 0, "right": 0}
+    for item in selected_excluded:
+        if item.get("review_required", item.get("review", True)):
+            excluded_reviews[side_of(as_box(item["bbox_xyxy"]))] += 1
+
+    result: dict[str, Any] = {"split_x": split_x, "cross_side_matches": cross_side_matches, "sides": {}}
+    for side in ("left", "right"):
+        truth_indices = {index for index, box in enumerate(truth) if side_of(box) == side}
+        prediction_indices = {index for index, box in enumerate(predicted) if side_of(box) == side}
+        correct_truth = {
+            truth_index for truth_index in truth_indices
+            if truth_index in matched_truth_to_pred and
+            side_of(predicted[matched_truth_to_pred[truth_index]]) == side
+        }
+        correct_predictions = {
+            prediction for prediction in prediction_indices
+            if prediction in matched_pred_to_truth and
+            side_of(truth[matched_pred_to_truth[prediction]]) == side
+        }
+        side_errors = error_predictions & prediction_indices
+        flagged_errors = flagged_error_predictions & prediction_indices
+        result["sides"][side] = {
+            "ground_truth_lines": len(truth_indices),
+            "predicted_crops": len(prediction_indices),
+            "true_positive_matches": len(correct_truth),
+            "false_positive_crops": len(prediction_indices) - len(correct_predictions),
+            "missed_lines": len(truth_indices) - len(correct_truth),
+            "precision": round(len(correct_predictions) / len(prediction_indices), 4)
+                        if prediction_indices else 0.0,
+            "recall": round(len(correct_truth) / len(truth_indices), 4) if truth_indices else 0.0,
+            "cross_side_matches": sum(
+                truth_index in matched_truth_to_pred and
+                side_of(predicted[matched_truth_to_pred[truth_index]]) != side
+                for truth_index in truth_indices
+            ),
+            "gutter_crossing_crops": crossing_by_side[side],
+            "review_candidates": sum(index in review_prediction_indices for index in prediction_indices) +
+                                 excluded_reviews[side],
+            "crop_error_candidates": len(side_errors),
+            "reviewed_crop_errors": len(flagged_errors),
+            "crop_error_review_recall": round(len(flagged_errors) / len(side_errors), 4)
+                                         if side_errors else None,
+        }
+    return result
+
+
+def aggregate_side_metrics(pages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    side_pages = [page["side_metrics"] for page in pages if page.get("side_metrics") is not None]
+    if not side_pages:
+        return None
+    aggregate: dict[str, Any] = {"annotated_pages": len(side_pages), "sides": {}}
+    for side in ("left", "right"):
+        rows = [page["sides"][side] for page in side_pages]
+        gt = sum(row["ground_truth_lines"] for row in rows)
+        predictions = sum(row["predicted_crops"] for row in rows)
+        tp = sum(row["true_positive_matches"] for row in rows)
+        errors = sum(row["crop_error_candidates"] for row in rows)
+        reviewed = sum(row["reviewed_crop_errors"] for row in rows)
+        aggregate["sides"][side] = {
+            "ground_truth_lines": gt, "predicted_crops": predictions,
+            "true_positive_matches": tp,
+            "false_positive_crops": sum(row["false_positive_crops"] for row in rows),
+            "missed_lines": sum(row["missed_lines"] for row in rows),
+            "precision": round(tp / predictions, 4) if predictions else 0.0,
+            "recall": round(tp / gt, 4) if gt else 0.0,
+            "cross_side_matches": sum(row["cross_side_matches"] for row in rows),
+            "gutter_crossing_crops": sum(row["gutter_crossing_crops"] for row in rows),
+            "review_candidates": sum(row["review_candidates"] for row in rows),
+            "crop_error_candidates": errors, "reviewed_crop_errors": reviewed,
+            "crop_error_review_recall": round(reviewed / errors, 4) if errors else None,
+        }
+    aggregate["cross_side_matches"] = sum(page["cross_side_matches"] for page in side_pages)
+    return aggregate
 
 
 def vertical_boundary_summary(errors: list[tuple[float, float]]) -> dict[str, Any]:
@@ -191,9 +297,50 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         raise ValueError("ground_truth_order must be a permutation of ground-truth line indices")
     reading_order = order_summary(predicted_truth_indices, truth_order)
 
+    source_line_box_results: list[dict[str, Any]] = []
+    source_line_coverage: list[float] = []
+    source_full = source_left = source_right = source_top = source_bottom = 0
+    for truth_index, truth_box in enumerate(truth):
+        pred_index = matched_truth_to_pred.get(truth_index)
+        if pred_index is None:
+            source_box = None
+            coverage = 0.0
+        else:
+            item = selected_items[pred_index]
+            source_box = as_box(item.get("source_crop_bbox_xyxy", item["bbox_xyxy"]))
+            coverage = intersection(source_box, truth_box) / area(truth_box)
+        retained = source_box is not None and contains(source_box, truth_box)
+        left_retained = source_box is not None and source_box[0] <= truth_box[0]
+        right_retained = source_box is not None and source_box[2] >= truth_box[2]
+        top_retained = source_box is not None and source_box[1] <= truth_box[1]
+        bottom_retained = source_box is not None and source_box[3] >= truth_box[3]
+        source_line_coverage.append(coverage)
+        source_full += int(retained)
+        source_left += int(left_retained)
+        source_right += int(right_retained)
+        source_top += int(top_retained)
+        source_bottom += int(bottom_retained)
+        source_line_box_results.append({
+            "truth_index": truth_index, "prediction_index": pred_index,
+            "source_crop_bbox_xyxy": list(source_box) if source_box is not None else None,
+            "area_coverage": round(coverage, 4), "fully_retained": retained,
+            "left_edge_retained": left_retained, "right_edge_retained": right_retained,
+            "top_edge_retained": top_retained, "bottom_edge_retained": bottom_retained,
+        })
+    source_line_box_retention = {
+        "annotated_line_boxes": len(truth), "matched_line_boxes": len(matched_truth),
+        "fully_retained": source_full,
+        "fully_retained_rate": round(source_full / len(truth), 4) if truth else None,
+        "mean_area_coverage": round(sum(source_line_coverage) / len(truth), 4) if truth else None,
+        "left_edge_retained": source_left, "right_edge_retained": source_right,
+        "top_edge_retained": source_top, "bottom_edge_retained": source_bottom,
+    }
+
     word_labels = page.get("ground_truth_words_xyxy", [])
     retained_words = 0
     word_results: list[dict[str, Any]] = []
+    word_left_edges = word_right_edges = word_both_edges = 0
+    word_horizontal_coverages: list[float] = []
     for word_index, word in enumerate(word_labels):
         if isinstance(word, dict):
             word_box = as_box(word["bbox_xyxy"])
@@ -210,15 +357,40 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         else:
             candidates = selected_items
         contained_by_crop = False
+        best_source: Box | None = None
+        best_horizontal_coverage = 0.0
         for item in candidates:
             source = item.get("source_crop_bbox_xyxy", item["bbox_xyxy"])
-            if contains(as_box(source), word_box):
+            source_box = as_box(source)
+            if contains(source_box, word_box):
                 contained_by_crop = True
-                break
+            horizontal_coverage = max(0.0, min(source_box[2], word_box[2]) -
+                                      max(source_box[0], word_box[0])) / (word_box[2] - word_box[0])
+            if best_source is None or horizontal_coverage > best_horizontal_coverage:
+                best_source, best_horizontal_coverage = source_box, horizontal_coverage
+        left_edge_retained = best_source is not None and best_source[0] <= word_box[0]
+        right_edge_retained = best_source is not None and best_source[2] >= word_box[2]
         retained_words += int(contained_by_crop)
         word_results.append({"word_index": word_index, "line_index": line_index,
-                             "retained_inside_matched_crop": contained_by_crop})
+                             "retained_inside_matched_crop": contained_by_crop,
+                             "left_edge_retained": left_edge_retained,
+                             "right_edge_retained": right_edge_retained,
+                             "horizontal_coverage": round(best_horizontal_coverage, 4)})
+        word_left_edges += int(left_edge_retained)
+        word_right_edges += int(right_edge_retained)
+        word_both_edges += int(left_edge_retained and right_edge_retained)
+        word_horizontal_coverages.append(best_horizontal_coverage)
     word_retention_rate = retained_words / len(word_labels) if word_labels else None
+    word_edge_retention = {
+        "labeled_words": len(word_labels), "fully_retained_words": retained_words,
+        "left_edges_retained": word_left_edges, "right_edges_retained": word_right_edges,
+        "both_edges_retained": word_both_edges,
+        "left_edge_retention_rate": round(word_left_edges / len(word_labels), 4) if word_labels else None,
+        "right_edge_retention_rate": round(word_right_edges / len(word_labels), 4) if word_labels else None,
+        "both_edges_retention_rate": round(word_both_edges / len(word_labels), 4) if word_labels else None,
+        "mean_horizontal_coverage": round(sum(word_horizontal_coverages) / len(word_labels), 4)
+                                    if word_labels else None,
+    }
 
     expected_region_ids = page.get("ground_truth_region_ids", [])
     region_boxes = page.get("ground_truth_regions", {})
@@ -309,6 +481,15 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         i for i, item in enumerate(selected_items) if item.get("review_required", False)
     }
     flagged_error_predictions = error_predictions & review_prediction_indices
+    side_split_x = page.get("side_split_x")
+    if side_split_x is not None:
+        side_split_x = float(side_split_x)
+        image_width = int(manifest.get("image_size", {}).get("width", 0))
+        if not 0 < side_split_x < image_width:
+            raise ValueError("side_split_x must lie inside the manifest image width")
+    side_metrics = geometric_side_metrics(
+        side_split_x, truth, predicted, selected_items, matches, selected_excluded,
+        error_predictions, review_prediction_indices, flagged_error_predictions)
     review_items = len(review_prediction_indices) + sum(
         bool(item.get("review_required", item.get("review", True))) for item in selected_excluded
     )
@@ -346,6 +527,9 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         "retained_words": retained_words,
         "clipped_or_unassigned_words": len(word_labels) - retained_words,
         "word_retention_rate": round(word_retention_rate, 4) if word_retention_rate is not None else None,
+        "source_line_box_retention": source_line_box_retention,
+        "source_line_box_results": source_line_box_results,
+        "word_edge_retention": word_edge_retention,
         "word_results": word_results,
         "region_assignment_count": region_assignment_count,
         "region_assignment_errors": region_assignment_errors,
@@ -353,6 +537,7 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
                                         if region_assignment_accuracy is not None else None),
         "reading_order": reading_order,
         "review_reason_counts": review_reason_counts,
+        "side_metrics": side_metrics,
         "runtime_ms": runtime_ms,
         "matches": matches,
     }
@@ -383,6 +568,16 @@ def main() -> int:
     total_reviewed_crop_errors = sum(page["reviewed_crop_errors"] for page in pages)
     total_words = sum(page["ground_truth_words"] for page in pages)
     total_retained_words = sum(page["retained_words"] for page in pages)
+    total_line_boxes = sum(page["source_line_box_retention"]["annotated_line_boxes"] for page in pages)
+    total_source_line_boxes_retained = sum(page["source_line_box_retention"]["fully_retained"] for page in pages)
+    total_source_area_coverage = sum(
+        page["source_line_box_retention"]["mean_area_coverage"] *
+        page["source_line_box_retention"]["annotated_line_boxes"]
+        for page in pages if page["source_line_box_retention"]["mean_area_coverage"] is not None
+    )
+    total_word_left_edges = sum(page["word_edge_retention"]["left_edges_retained"] for page in pages)
+    total_word_right_edges = sum(page["word_edge_retention"]["right_edges_retained"] for page in pages)
+    total_word_both_edges = sum(page["word_edge_retention"]["both_edges_retained"] for page in pages)
     total_region_assignments = sum(page["region_assignment_count"] for page in pages)
     total_region_errors = sum(page["region_assignment_errors"] for page in pages)
     order_pairs = sum(page["reading_order"]["comparable_pairs"] for page in pages)
@@ -400,6 +595,7 @@ def main() -> int:
     ]
     error_pages = [page for page in pages if page["page_has_segmentation_error"]]
     reviewed_error_pages = sum(page["page_has_review_alert"] for page in error_pages)
+    side_aggregates = aggregate_side_metrics(pages)
     result = {
         "benchmark": "hand-labeled line-crop evaluation",
         "matching": f"greedy one-to-one IoU >= {threshold:.3f}; boxes are xyxy with exclusive right/bottom edges",
@@ -429,6 +625,27 @@ def main() -> int:
             "retained_words": total_retained_words,
             "clipped_or_unassigned_words": total_words - total_retained_words,
             "word_retention_rate": round(total_retained_words / total_words, 4) if total_words else None,
+            "source_line_box_retention": {
+                "annotated_line_boxes": total_line_boxes,
+                "fully_retained": total_source_line_boxes_retained,
+                "fully_retained_rate": (round(total_source_line_boxes_retained / total_line_boxes, 4)
+                                         if total_line_boxes else None),
+                "mean_area_coverage": (round(total_source_area_coverage / total_line_boxes, 4)
+                                        if total_line_boxes else None),
+                "left_edge_retained": sum(page["source_line_box_retention"]["left_edge_retained"] for page in pages),
+                "right_edge_retained": sum(page["source_line_box_retention"]["right_edge_retained"] for page in pages),
+                "top_edge_retained": sum(page["source_line_box_retention"]["top_edge_retained"] for page in pages),
+                "bottom_edge_retained": sum(page["source_line_box_retention"]["bottom_edge_retained"] for page in pages),
+            },
+            "word_edge_retention": {
+                "labeled_words": total_words, "fully_retained_words": total_retained_words,
+                "left_edges_retained": total_word_left_edges,
+                "right_edges_retained": total_word_right_edges,
+                "both_edges_retained": total_word_both_edges,
+                "left_edge_retention_rate": round(total_word_left_edges / total_words, 4) if total_words else None,
+                "right_edge_retention_rate": round(total_word_right_edges / total_words, 4) if total_words else None,
+                "both_edges_retention_rate": round(total_word_both_edges / total_words, 4) if total_words else None,
+            },
             "region_assignments": total_region_assignments,
             "region_assignment_errors": total_region_errors,
             "region_assignment_accuracy": (round((total_region_assignments - total_region_errors) /
@@ -442,10 +659,10 @@ def main() -> int:
             "pages_with_runtime": len(runtimes),
             "runtime_ms_mean": round(statistics.mean(runtimes), 3) if runtimes else None,
             "runtime_ms_median": round(statistics.median(runtimes), 3) if runtimes else None,
-            "runtime_ms_p95": (round(sorted_runtimes[min(len(sorted_runtimes) - 1,
-                                                       int((len(sorted_runtimes) - 1) * 0.95))], 3)
+            "runtime_ms_p95": (round(nearest_rank_percentile(runtimes, 0.95), 3)
                                if runtimes else None),
             "vertical_boundary": vertical_boundary_summary(all_vertical_errors),
+            "side_metrics": side_aggregates,
         },
     }
     output = json.dumps(result, ensure_ascii=False, indent=2)

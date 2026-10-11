@@ -52,6 +52,7 @@ struct Band {
     int region_x1 = -1; // exclusive
     int gutter_crop_x0 = -1; // inclusive safe limit, when a left gutter exists
     int gutter_crop_x1 = -1; // inclusive safe limit, when a right gutter exists
+    bool shallow_recovered = false;
 };
 
 struct RegionCropExtent {
@@ -894,6 +895,16 @@ static void mark_uncertain_bands(std::vector<Band>& bands, int width, int height
         const bool unusually_short = bh < std::max(4, static_cast<int>(std::lround(region_height * 0.65)));
         if (bw < width * 0.16 && b.components <= 5 && (unusually_short || close_vertical_fragment))
             b.review_reasons.emplace_back("short_or_fragmentary_text_candidate");
+        const int local_width = b.region_x1 > b.region_x0 ? b.region_x1 - b.region_x0 : width;
+        const bool substantial_text_support = b.components >= 4 &&
+            b.ink >= std::max<uint64_t>(32, static_cast<uint64_t>(std::lround(bw * 0.02)));
+        if (b.shallow_recovered) {
+            b.review_reasons.emplace_back("shallow_candidate_expanded_from_local_ink");
+        } else if (bh < std::max(4, static_cast<int>(std::lround(region_height * 0.60))) &&
+                   bw >= std::max(24, static_cast<int>(std::lround(local_width * 0.18))) &&
+                   substantial_text_support) {
+            b.review_reasons.emplace_back("suspiciously_shallow_candidate");
+        }
         if (b.x0 <= edge_x || b.y0 <= edge_y || b.x1 >= width - edge_x || b.y1 >= height - edge_y)
             b.review_reasons.emplace_back("possible_page_edge_clipping");
     }
@@ -916,11 +927,179 @@ static int band_peak_row_ink(const std::vector<uint8_t>& mask, int width,
     return peak;
 }
 
+static int band_dark_reference(const std::vector<uint8_t>& gray,
+                               const std::vector<uint8_t>& mask,
+                               int width, const Band& band) {
+    std::array<int, 256> histogram{};
+    int total = 0;
+    for (int y = band.y0; y <= band.y1; ++y) {
+        const size_t row = static_cast<size_t>(y) * width;
+        for (int x = std::max(0, band.x0); x <= std::min(width - 1, band.x1); ++x) {
+            const size_t position = row + static_cast<size_t>(x);
+            if (!mask[position]) continue;
+            ++histogram[gray[position]];
+            ++total;
+        }
+    }
+    if (total == 0) return 0;
+    const int target = (total - 1) / 2;
+    int cumulative = 0;
+    for (int value = 0; value < 256; ++value) {
+        cumulative += histogram[static_cast<size_t>(value)];
+        if (cumulative > target) return value;
+    }
+    return 0;
+}
+
+static int faint_row_ink_in_xrange(const std::vector<uint8_t>& gray, int width,
+                                   int y, int x0, int x1, int dark_reference) {
+    const int left = std::max(0, x0), right = std::min(width - 1, x1);
+    if (y < 0 || left > right) return 0;
+    std::array<int, 256> histogram{};
+    const size_t row = static_cast<size_t>(y) * width;
+    const int count = right - left + 1;
+    for (int x = left; x <= right; ++x)
+        ++histogram[gray[row + static_cast<size_t>(x)]];
+    const int background_rank = static_cast<int>((static_cast<uint64_t>(count) * 85 + 99) / 100);
+    int background = 255, cumulative = 0;
+    for (int value = 0; value < 256; ++value) {
+        cumulative += histogram[static_cast<size_t>(value)];
+        if (cumulative >= background_rank) { background = value; break; }
+    }
+    const int contrast = std::max(0, background - dark_reference);
+    const int minimum_weak_threshold = std::min(224, dark_reference + 4);
+    const int weak_threshold = std::clamp(
+        background - std::max(8, static_cast<int>(std::lround(contrast * 0.40))),
+        minimum_weak_threshold, 224);
+    int support = 0;
+    for (int value = 0; value <= weak_threshold; ++value)
+        support += histogram[static_cast<size_t>(value)];
+    return support;
+}
+
 static int median_value(std::vector<int> values, int fallback) {
     if (values.empty()) return fallback;
     const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
     std::nth_element(values.begin(), middle, values.end());
     return *middle;
+}
+
+static size_t recover_shallow_bands(std::vector<Band>& bands,
+                                    const std::vector<uint8_t>& mask,
+                                    const std::vector<uint8_t>& gray,
+                                    int width, int height, bool debug = false) {
+    if (bands.size() < 4 || width <= 0 || height <= 0) return 0;
+    std::vector<size_t> order(bands.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (bands[a].y0 != bands[b].y0) return bands[a].y0 < bands[b].y0;
+        return bands[a].x0 < bands[b].x0;
+    });
+
+    std::vector<int> all_heights;
+    for (const auto& band : bands) {
+        const int band_height = band.y1 - band.y0 + 1;
+        if (!band.non_text_fragment && !band.page_number && band_height >= 4 && band_height <= height * 0.08)
+            all_heights.push_back(band_height);
+    }
+    const int overall_scale = median_value(std::move(all_heights), 12);
+    size_t recovered = 0;
+    for (size_t position = 0; position < order.size(); ++position) {
+        auto& band = bands[order[position]];
+        if (band.non_text_fragment || band.page_number) continue;
+        const int original_height = band.y1 - band.y0 + 1;
+        if (original_height < 4 || original_height > height * 0.08) continue;
+        const int original_y0 = band.y0;
+        const int original_y1_exclusive = band.y1 + 1;
+
+        std::vector<int> neighbor_heights;
+        for (int distance = 1; distance <= 3; ++distance) {
+            for (const int direction : {-1, 1}) {
+                const auto neighbor_position = static_cast<long long>(position) + direction * distance;
+                if (neighbor_position < 0 || neighbor_position >= static_cast<long long>(order.size())) continue;
+                const auto& neighbor = bands[order[static_cast<size_t>(neighbor_position)]];
+                const int neighbor_height = neighbor.y1 - neighbor.y0 + 1;
+                if (!neighbor.non_text_fragment && !neighbor.page_number && neighbor_height >= 6 &&
+                    neighbor_height <= height * 0.08)
+                    neighbor_heights.push_back(neighbor_height);
+            }
+        }
+        const int local_scale = median_value(std::move(neighbor_heights), overall_scale);
+        if (local_scale < 6 || original_height >= std::lround(local_scale * 0.82)) continue;
+        const int box_width = band.x1 - band.x0 + 1;
+        const uint64_t minimum_ink = std::max<uint64_t>(32, static_cast<uint64_t>(std::lround(box_width * 0.02)));
+        if (box_width < std::max(24, static_cast<int>(std::lround(width * 0.12))) ||
+            band.components < 4 || band.ink < minimum_ink)
+            continue;
+
+        const int peak = band_peak_row_ink(mask, width, band);
+        if (peak < 8) continue;
+        const int dark_reference = band_dark_reference(gray, mask, width, band);
+        const int support_floor = std::max(4, static_cast<int>(std::ceil(peak * 0.015)));
+        const int max_expansion = std::max(2, static_cast<int>(std::lround(local_scale * 0.90)));
+        const int max_internal_valley = std::max(2, static_cast<int>(std::lround(local_scale * 0.18)));
+        int lower_limit = std::max(0, band.y0 - max_expansion);
+        int upper_limit = std::min(height, band.y1 + 1 + max_expansion);
+        if (position > 0) {
+            const auto& previous = bands[order[position - 1]];
+            const int previous_end = previous.y1 + 1;
+            if (previous_end >= band.y0) lower_limit = band.y0;
+            else lower_limit = std::max(lower_limit, previous_end + (band.y0 - previous_end + 1) / 2);
+        }
+        if (position + 1 < order.size()) {
+            const auto& next = bands[order[position + 1]];
+            const int current_end = band.y1 + 1;
+            if (next.y0 <= current_end) upper_limit = current_end;
+            else upper_limit = std::min(upper_limit, current_end + (next.y0 - current_end + 1) / 2);
+        }
+
+        int expanded_y0 = band.y0;
+        int upper_valley = 0;
+        for (int y = band.y0 - 1; y >= lower_limit; --y) {
+            const int strong_support = row_ink_in_xrange(mask, width, y, band.x0, band.x1);
+            const int faint_support = strong_support < support_floor
+                ? faint_row_ink_in_xrange(gray, width, y, band.x0, band.x1, dark_reference) : 0;
+            const int support = std::max(strong_support, faint_support);
+            if (debug) std::cerr << "debug: shallow_support side=top y=" << y << " strong=" << strong_support
+                                 << " faint=" << faint_support << " threshold=" << support_floor << "\n";
+            if (support >= support_floor) { expanded_y0 = y; upper_valley = 0; }
+            else {
+                if (support > 0 && support * 2 >= support_floor) expanded_y0 = y;
+                if (++upper_valley > max_internal_valley) break;
+            }
+        }
+        int expanded_y1_exclusive = band.y1 + 1;
+        int lower_valley = 0;
+        for (int y = band.y1 + 1; y < upper_limit; ++y) {
+            const int strong_support = row_ink_in_xrange(mask, width, y, band.x0, band.x1);
+            const int faint_support = strong_support < support_floor
+                ? faint_row_ink_in_xrange(gray, width, y, band.x0, band.x1, dark_reference) : 0;
+            const int support = std::max(strong_support, faint_support);
+            if (debug) std::cerr << "debug: shallow_support side=bottom y=" << y << " strong=" << strong_support
+                                 << " faint=" << faint_support << " threshold=" << support_floor << "\n";
+            if (support >= support_floor) { expanded_y1_exclusive = y + 1; lower_valley = 0; }
+            else {
+                if (support > 0 && support * 2 >= support_floor) expanded_y1_exclusive = y + 1;
+                if (++lower_valley > max_internal_valley) break;
+            }
+        }
+        const int expanded_height = expanded_y1_exclusive - expanded_y0;
+        if (expanded_height < original_height + 3) continue;
+
+        uint64_t expanded_ink = 0;
+        for (int y = expanded_y0; y < expanded_y1_exclusive; ++y)
+            expanded_ink += static_cast<uint64_t>(row_ink_in_xrange(mask, width, y, band.x0, band.x1));
+        band.y0 = expanded_y0;
+        band.y1 = expanded_y1_exclusive - 1;
+        band.ink = expanded_ink;
+        band.shallow_recovered = true;
+        ++recovered;
+        if (debug)
+            std::cerr << "debug: shallow_band_expanded original=[" << original_y0 << ","
+                      << original_y1_exclusive << ") expanded=[" << band.y0 << "," << band.y1 + 1
+                      << ") local_scale=" << local_scale << " support_floor=" << support_floor << "\n";
+    }
+    return recovered;
 }
 
 static void refine_vertical_boundaries(std::vector<Band>& bands,
@@ -1297,16 +1476,21 @@ int main(int argc, char** argv) {
             const int rw = r.x1 - r.x0, rh = r.y1 - r.y0;
             if (rw <= 0 || rh <= 0) continue;
             std::vector<uint8_t> local_mask(static_cast<size_t>(rw) * rh, 0);
+            std::vector<uint8_t> local_gray(static_cast<size_t>(rw) * rh, 255);
             for (int y = 0; y < rh; ++y) {
                 const int page_y = r.y0 + y;
                 const int row_left = lineforge_layout::left_at(r, page_y);
                 const int row_right = lineforge_layout::right_at(r, page_y);
                 const int copy_width = std::max(0, row_right - row_left);
                 const auto source = mask.begin() + static_cast<size_t>(page_y) * processed.width + row_left;
+                const auto source_gray = processed.pixels.begin() + static_cast<size_t>(page_y) * processed.width + row_left;
                 std::copy_n(source, copy_width,
                     local_mask.begin() + static_cast<size_t>(y) * rw + (row_left - r.x0));
+                std::copy_n(source_gray, copy_width,
+                    local_gray.begin() + static_cast<size_t>(y) * rw + (row_left - r.x0));
             }
             auto local_bands = find_bands(local_mask, rw, rh, opt.debug);
+            recover_shallow_bands(local_bands, local_mask, local_gray, rw, rh, opt.debug);
             for (auto& b : local_bands) {
                 b.x0 += r.x0; b.x1 += r.x0;
                 b.y0 += r.y0; b.y1 += r.y0;
