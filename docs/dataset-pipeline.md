@@ -6,6 +6,24 @@ This is a **LineForge-owned data-preparation workflow**, not an NTF training imp
 
 The pipeline has a local staged-PDF source interface and a local SQLite quota ledger. The LineForge dispatcher starts **exactly 19 worker processes plus one live coordinator on the same trusted host**. Workers share one filesystem and one atomic SQLite ledger, so the exact-count cap is enforced without pretending isolated hosted matrix jobs share storage. The manual GitHub Action invokes this dispatcher on a dedicated self-hosted runner. It does not access Telegram, fetch source PDFs, transfer a Telegram session, or publish dataset content unless the separate publication input is selected.
 
+## Isolated one-job / one-image pilot
+
+Use `scripts/lineforge_pilot.py` only to smoke-test the local path without invoking the production dispatcher. It requires exactly one manifest entry with explicit local redistribution-rights provenance, renders only one-based page 10, invokes the supplied `linecrop` executable once, and accepts at most one image into a fresh output directory. It writes `pilot-summary.json`, `pilot-dataset-manifest.json`, one content-addressed PNG, and a local quota ledger. The summary and manifest always say `publishable: false`; this result is not accepted by the full-run publisher.
+
+Example (keep the manifest, staged PDF, and output outside the repository):
+
+```bash
+python3 scripts/lineforge_pilot.py \\
+  --input-manifest /secure/pilot-source/manifest.json \\
+  --source-root /secure/pilot-source \\
+  --run-dir /secure/pilot-output/one-image-run \\
+  --run-id pilot-001 \\
+  --linecrop /path/to/linecrop \\
+  --dpi 300
+```
+
+When real-source redistribution rights are unavailable, construct a local synthetic PDF fixture and use only that fixture. The pilot does not start GitHub Actions, the 19-worker production flow, or any Hugging Face preflight or upload.
+
 No dispatch or upload was started during this implementation. The Action is manual-only, restricted to `main`, and has no automatic push, pull-request, schedule, or Hugging Face trigger. Its optional `publish_to_hf` input defaults to `false`.
 
 ## Source manifest and rights gate

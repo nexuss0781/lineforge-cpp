@@ -79,6 +79,10 @@ The workbook/answer-row and handwriting-like tests are synthetic. No real handwr
 
 Deskew is limited to mild skew (±5°); perspective correction and arbitrary page dewarping are out of scope. Adaptive thresholding can compensate for uneven illumination but cannot recover missing or blurred source detail. Large images are limited to 100 megapixels to prevent accidental memory exhaustion. Inspect `review_required` crops and every `excluded` manifest entry before bulk processing.
 
+## Isolated one-job pilot
+
+`scripts/lineforge_pilot.py` is a separate local smoke-test path: it accepts exactly one staged PDF, renders page 10 once, runs LineForge once, and accepts exactly one unique line image. It refuses to reuse an output directory, records local provenance, and always marks the result non-publishable. Use a generated synthetic PDF when source-specific redistribution rights are not established. This pilot does not call the 19-worker dispatcher, GitHub Actions workflow, or Hugging Face publisher.
+
 ## LineForge dataset preparation and dispatch
 
 The LineForge-owned dataset pipeline is documented in [`docs/dataset-pipeline.md`](docs/dataset-pipeline.md). It stages local PDFs, dispatches 19 LineForge worker processes plus one live coordinator on a single trusted runner, enforces an exact shared quota, and collects per-image provenance. It does not run OCR or training. The manual GitHub Action requires a configured dedicated runner and an approved local source manifest; its Hugging Face publisher is separately gated by a default-off manual input and fails closed until output integrity, per-source rights, and an explicit compatible dataset license are verified.
