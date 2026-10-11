@@ -48,7 +48,57 @@ struct Band {
     int ink_y1 = -1;
     int crop_y0 = -1;
     int crop_y1 = -1;
+    int region_x0 = -1;
+    int region_x1 = -1; // exclusive
+    int gutter_crop_x0 = -1; // inclusive safe limit, when a left gutter exists
+    int gutter_crop_x1 = -1; // inclusive safe limit, when a right gutter exists
 };
+
+struct RegionCropExtent {
+    int gutter_left_x = -1;
+    int gutter_right_x = -1;
+};
+
+static std::vector<RegionCropExtent> find_gutter_crop_extents(
+    const std::vector<LayoutRegion>& regions, int image_width, bool enabled) {
+    std::vector<RegionCropExtent> extents(regions.size());
+    if (!enabled) return extents;
+
+    const int minimum_gap = std::max(8, image_width / 200);
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto& region = regions[i];
+        int nearest_left = -1;
+        int nearest_right = -1;
+        for (size_t j = 0; j < regions.size(); ++j) {
+            if (i == j) continue;
+            const auto& other = regions[j];
+            const int vertical_overlap = std::min(region.y1, other.y1) -
+                                         std::max(region.y0, other.y0);
+            const int smaller_height = std::min(region.y1 - region.y0,
+                                                other.y1 - other.y0);
+            if (vertical_overlap <= 0 || vertical_overlap * 2 < smaller_height)
+                continue;
+
+            if (other.x1 <= region.x0 && region.x0 - other.x1 >= minimum_gap &&
+                (nearest_left < 0 || other.x1 > regions[static_cast<size_t>(nearest_left)].x1))
+                nearest_left = static_cast<int>(j);
+            if (region.x1 <= other.x0 && other.x0 - region.x1 >= minimum_gap &&
+                (nearest_right < 0 || other.x0 < regions[static_cast<size_t>(nearest_right)].x0))
+                nearest_right = static_cast<int>(j);
+        }
+
+        if (nearest_left >= 0) {
+            const auto& left = regions[static_cast<size_t>(nearest_left)];
+            extents[i].gutter_left_x = left.x1 + (region.x0 - left.x1) / 2;
+        }
+        if (nearest_right >= 0) {
+            const auto& right = regions[static_cast<size_t>(nearest_right)];
+            const int divider = region.x1 + (right.x0 - region.x1) / 2;
+            extents[i].gutter_right_x = divider - 1;
+        }
+    }
+    return extents;
+}
 
 static void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
@@ -1009,17 +1059,33 @@ static void refine_vertical_boundaries(std::vector<Band>& bands,
     }
 }
 
-static Image crop_with_white_padding(const Image& gray, const Band& b) {
+static Image crop_with_white_padding(const Image& gray, const Band& b,
+                                     std::array<int, 4>* source_bbox = nullptr) {
     const int ink_y0 = b.ink_y0 >= 0 ? b.ink_y0 : b.y0;
     const int ink_y1 = b.ink_y1 >= ink_y0 ? b.ink_y1 : b.y1;
     const int line_h = ink_y1 - ink_y0 + 1;
     // Detached Ethiopic marks often sit above or below the main glyph bodies.
     const int pad_y = std::max(3, static_cast<int>(std::lround(line_h * 0.55)));
     const int pad_x = std::max(4, static_cast<int>(std::lround(line_h * 0.18)));
-    const int x0 = std::max(0, b.x0 - pad_x), x1 = std::min(gray.width - 1, b.x1 + pad_x);
+    const int crop_scale_height = std::max(line_h, b.y1 - b.y0 + 1);
+    int x0 = std::max(0, b.x0 - pad_x);
+    int x1 = std::min(gray.width - 1, b.x1 + pad_x);
+    const int gutter_pad = std::max(pad_x, static_cast<int>(std::lround(crop_scale_height * 0.55)));
+    const int near_gutter_edge = std::max(2, static_cast<int>(std::lround(crop_scale_height * 0.12)));
+    if (b.gutter_crop_x0 >= 0 && b.region_x0 >= 0 &&
+        b.x0 <= b.region_x0 + near_gutter_edge) {
+        x0 = std::max(0, std::max(b.gutter_crop_x0,
+                                  std::min(x0, b.x0 - gutter_pad)));
+    }
+    if (b.gutter_crop_x1 >= 0 && b.region_x1 > 0 &&
+        b.x1 >= b.region_x1 - 1 - near_gutter_edge) {
+        x1 = std::min(gray.width - 1, std::min(b.gutter_crop_x1,
+                                               std::max(x1, b.x1 + gutter_pad)));
+    }
     const int y0 = b.crop_y0 >= 0 ? b.crop_y0 : std::max(0, b.y0 - pad_y);
     const int y1 = b.crop_y1 >= y0 ? b.crop_y1 : std::min(gray.height - 1, b.y1 + pad_y);
     const int ow = x1 - x0 + 1, oh = y1 - y0 + 1;
+    if (source_bbox) *source_bbox = {x0, y0, x1 + 1, y1 + 1};
     const int border = std::max(2, static_cast<int>(std::lround(line_h * 0.10)));
     Image out{ow + 2 * border, oh + 2 * border, std::vector<uint8_t>(static_cast<size_t>(ow + 2 * border) * (oh + 2 * border), 255)};
     for (int y = 0; y < oh; ++y)
@@ -1191,6 +1257,9 @@ int main(int argc, char** argv) {
                                                        opt.reading_order == "rtl");
         }
 
+        const auto crop_extents = find_gutter_crop_extents(
+            regions, processed.width, opt.custom_regions.empty() && opt.layout == "auto");
+
         std::vector<Band> bands;
         std::vector<size_t> lines_per_region(regions.size(), 0);
         for (size_t region_index = 0; region_index < regions.size(); ++region_index) {
@@ -1207,6 +1276,10 @@ int main(int argc, char** argv) {
                 b.x0 += r.x0; b.x1 += r.x0;
                 b.y0 += r.y0; b.y1 += r.y0;
                 b.region = static_cast<int>(region_index + 1);
+                b.region_x0 = r.x0;
+                b.region_x1 = r.x1;
+                b.gutter_crop_x0 = crop_extents[region_index].gutter_left_x;
+                b.gutter_crop_x1 = crop_extents[region_index].gutter_right_x;
             }
             lines_per_region[region_index] = local_bands.size();
             bands.insert(bands.end(), local_bands.begin(), local_bands.end());
@@ -1233,6 +1306,10 @@ int main(int argc, char** argv) {
                 const auto& r = regions[i];
                 std::cerr << "debug: region=" << i + 1 << " bbox=[" << r.x0 << "," << r.y0 << ","
                           << r.x1 << "," << r.y1 << "] lines=" << lines_per_region[i] << "\n";
+                if (crop_extents[i].gutter_left_x >= 0 || crop_extents[i].gutter_right_x >= 0)
+                    std::cerr << "debug: gutter_crop_extent region=" << i + 1
+                              << " left=" << crop_extents[i].gutter_left_x
+                              << " right=" << crop_extents[i].gutter_right_x << "\n";
             }
         }
         fs::create_directories(opt.output);
@@ -1256,11 +1333,14 @@ int main(int argc, char** argv) {
         for (const auto& b : bands) {
             if (b.page_number || b.non_text_fragment) { ++skipped; continue; }
             const std::string name = "line_" + (kept + 1 < 10 ? std::string("000") : kept + 1 < 100 ? std::string("00") : kept + 1 < 1000 ? std::string("0") : std::string()) + std::to_string(kept + 1) + ".png";
-            Image crop = crop_with_white_padding(processed, b);
+            std::array<int, 4> source_crop_bbox{};
+            Image crop = crop_with_white_padding(processed, b, &source_crop_bbox);
             write_png_gray(fs::path(opt.output) / name, crop);
             if (kept) manifest << ",\n";
             manifest << "    {\"file\": \"" << name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
-                     << "], \"crop_size\": [" << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
+                     << "], \"source_crop_bbox_xyxy\": [" << source_crop_bbox[0] << ", " << source_crop_bbox[1]
+                     << ", " << source_crop_bbox[2] << ", " << source_crop_bbox[3] << "], \"crop_size\": ["
+                     << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
                      << ", \"region\": " << b.region << ", \"review_required\": "
                      << (b.review_reasons.empty() ? "false" : "true") << ", \"review_reasons\": [";
             for (size_t i = 0; i < b.review_reasons.size(); ++i) {
