@@ -1,0 +1,7 @@
+build/
+cmake-build-*/
+.venv/
+benchmark-output/
+line-crops/
+__pycache__/
+*.pyc
