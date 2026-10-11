@@ -35,7 +35,9 @@ struct Band {
     uint64_t ink = 0;
     int components = 0;
     bool page_number = false;
+    bool non_text_fragment = false;
     int region = 0;
+    std::vector<std::string> review_reasons;
 };
 
 static void require(bool ok, const std::string& message) {
@@ -202,6 +204,68 @@ static std::vector<uint32_t> horizontal_sums(const Image& im, int y, int radius)
     return row;
 }
 
+static Image flatten_illumination(const Image& gray, bool debug = false) {
+    if (gray.width < 32 || gray.height < 32) return gray;
+    const int tile = std::clamp(std::min(gray.width, gray.height) / 18, 32, 96);
+    const int grid_width = (gray.width + tile - 1) / tile;
+    const int grid_height = (gray.height + tile - 1) / tile;
+    std::vector<int> background(static_cast<size_t>(grid_width) * grid_height, 255);
+    std::vector<int> histogram(256);
+    for (int gy = 0; gy < grid_height; ++gy) for (int gx = 0; gx < grid_width; ++gx) {
+        std::fill(histogram.begin(), histogram.end(), 0);
+        const int x0 = gx * tile, x1 = std::min(gray.width, x0 + tile);
+        const int y0 = gy * tile, y1 = std::min(gray.height, y0 + tile);
+        int count = 0;
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            ++histogram[gray.pixels[static_cast<size_t>(y) * gray.width + x]];
+            ++count;
+        }
+        const int target = std::max(1, (count * 90 + 99) / 100);
+        int cumulative = 0, percentile = 255;
+        for (int value = 0; value < 256; ++value) {
+            cumulative += histogram[value];
+            if (cumulative >= target) { percentile = value; break; }
+        }
+        background[static_cast<size_t>(gy) * grid_width + gx] = std::max(32, percentile);
+    }
+
+    // Smooth tile estimates to avoid creating boundaries where illumination
+    // transitions cross a grid cell.
+    std::vector<int> smooth_background(background.size(), 255);
+    for (int gy = 0; gy < grid_height; ++gy) for (int gx = 0; gx < grid_width; ++gx) {
+        int weighted = 0, weights = 0;
+        for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = gx + dx, ny = gy + dy;
+            if (nx < 0 || nx >= grid_width || ny < 0 || ny >= grid_height) continue;
+            const int weight = (dx == 0 && dy == 0) ? 4 : (dx == 0 || dy == 0) ? 2 : 1;
+            weighted += background[static_cast<size_t>(ny) * grid_width + nx] * weight;
+            weights += weight;
+        }
+        smooth_background[static_cast<size_t>(gy) * grid_width + gx] = weighted / std::max(1, weights);
+    }
+    std::vector<int> reference_values = smooth_background;
+    const auto middle = reference_values.begin() + reference_values.size() / 2;
+    std::nth_element(reference_values.begin(), middle, reference_values.end());
+    const int reference = std::clamp(*middle, 96, 255);
+
+    Image flat{gray.width, gray.height, std::vector<uint8_t>(gray.pixels.size())};
+    for (int y = 0; y < gray.height; ++y) for (int x = 0; x < gray.width; ++x) {
+        const double gx = std::clamp((x + 0.5) / tile - 0.5, 0.0, static_cast<double>(grid_width - 1));
+        const double gy = std::clamp((y + 0.5) / tile - 0.5, 0.0, static_cast<double>(grid_height - 1));
+        const int x0 = static_cast<int>(gx), y0 = static_cast<int>(gy);
+        const int x1 = std::min(grid_width - 1, x0 + 1), y1 = std::min(grid_height - 1, y0 + 1);
+        const double fx = gx - x0, fy = gy - y0;
+        const auto at = [&](int px, int py) { return smooth_background[static_cast<size_t>(py) * grid_width + px]; };
+        const double bg = std::max(32.0, (1.0 - fy) * ((1.0 - fx) * at(x0, y0) + fx * at(x1, y0)) +
+                                              fy * ((1.0 - fx) * at(x0, y1) + fx * at(x1, y1)));
+        const size_t pos = static_cast<size_t>(y) * gray.width + x;
+        flat.pixels[pos] = static_cast<uint8_t>(std::clamp(std::lround(gray.pixels[pos] * reference / bg), 0l, 255l));
+    }
+    if (debug) std::cerr << "debug: illumination_flattening tile=" << tile << " reference_background=" << reference
+                         << " grid=" << grid_width << "x" << grid_height << "\n";
+    return flat;
+}
+
 static std::vector<uint8_t> threshold_image(const Image& gray, bool debug = false) {
     const size_t n = gray.pixels.size();
     auto [min_it, max_it] = std::minmax_element(gray.pixels.begin(), gray.pixels.end());
@@ -247,7 +311,7 @@ static std::vector<uint8_t> threshold_image(const Image& gray, bool debug = fals
 }
 
 static void suppress_page_rules(std::vector<uint8_t>& mask, int width, int height) {
-    std::vector<uint8_t> rule_column(width, 0);
+    std::vector<uint8_t> candidates(width, 0), rule_column(width, 0), binding_column(width, 0);
     for (int x = 0; x < width; ++x) {
         int run = 0, longest = 0, count = 0;
         for (int y = 0; y < height; ++y) {
@@ -255,24 +319,71 @@ static void suppress_page_rules(std::vector<uint8_t>& mask, int width, int heigh
             else run = 0;
         }
         const bool near_outer_area = x < width * 0.25 || x > width * 0.75;
-        if (near_outer_area && longest >= height * 0.40 && count >= height * 0.45)
-            rule_column[x] = 1;
+        const bool near_binding = std::abs(x - width * 0.5) <= width * 0.20;
+        const bool continuous_outer_rule = near_outer_area && longest >= height * 0.40 && count >= height * 0.45;
+        const bool interrupted_binding = near_binding && longest >= height * 0.08 && count >= height * 0.18;
+        if (continuous_outer_rule || interrupted_binding)
+            candidates[x] = 1;
+    }
+
+    // A narrow continuous stroke near the center is usually the dark book
+    // binding that visually joins both pages into every horizontal band. Do
+    // not erase broad central artwork (for example, a cover photograph).
+    for (int x = 0; x < width;) {
+        if (!candidates[x]) { ++x; continue; }
+        const int start = x;
+        while (x < width && candidates[x]) ++x;
+        const int end = x;
+        const bool outer_rule = start < width * 0.25 || end > width * 0.75;
+        const int group_width = end - start;
+        const bool narrow_center_rule = group_width <= std::max(8, static_cast<int>(std::lround(width * 0.08))) &&
+                                        std::abs((start + end) / 2.0 - width * 0.5) <= width * 0.20;
+        if (outer_rule)
+            for (int xx = start; xx < end; ++xx) rule_column[xx] = 1;
+        else if (narrow_center_rule)
+            for (int xx = start; xx < end; ++xx) {
+                rule_column[xx] = 1;
+                binding_column[xx] = 1;
+            }
     }
     const int padding = std::max(2, std::min(16, static_cast<int>(std::lround(width * 0.01))));
     for (int x = 0; x < width; ++x) {
         if (!rule_column[x]) continue;
-        for (int xx = std::max(0, x - padding); xx <= std::min(width - 1, x + padding); ++xx)
+        const int column_padding = binding_column[x]
+            ? std::max(padding, static_cast<int>(std::lround(width * 0.025))) : padding;
+        for (int xx = std::max(0, x - column_padding); xx <= std::min(width - 1, x + column_padding); ++xx)
             for (int y = 0; y < height; ++y) mask[static_cast<size_t>(y) * width + xx] = 0;
+    }
+
+    // Long scan-bed/page-edge bars create full-width false text bands. Restrict
+    // this cleanup to the outer 6% and require a substantial contiguous run.
+    std::vector<uint8_t> rule_row(height, 0);
+    for (int y = 0; y < height; ++y) {
+        int run = 0, longest = 0, count = 0;
+        for (int x = 0; x < width; ++x) {
+            if (mask[static_cast<size_t>(y) * width + x]) { ++run; ++count; longest = std::max(longest, run); }
+            else run = 0;
+        }
+        const bool near_page_edge = y < height * 0.06 || y > height * 0.94;
+        if (near_page_edge && longest >= width * 0.40 && count >= width * 0.45)
+            rule_row[y] = 1;
+    }
+    const int row_padding = std::max(2, std::min(12, static_cast<int>(std::lround(height * 0.01))));
+    for (int y = 0; y < height; ++y) {
+        if (!rule_row[y]) continue;
+        for (int yy = std::max(0, y - row_padding); yy <= std::min(height - 1, y + row_padding); ++yy)
+            std::fill_n(mask.begin() + static_cast<size_t>(yy) * width, width, static_cast<uint8_t>(0));
     }
 }
 
 static void remove_tiny_components(std::vector<uint8_t>& mask, int width, int height) {
     std::vector<uint8_t> visited(mask.size(), 0);
     std::vector<uint32_t> component;
+    std::vector<uint32_t> tiny_pixels;
     component.reserve(32);
     for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
         const size_t start = static_cast<size_t>(y) * width + x;
-        if (mask[start] != 1 || visited[start]) continue;
+        if (mask[start] == 0 || visited[start]) continue;
         component.clear();
         component.push_back(static_cast<uint32_t>(start));
         visited[start] = 1;
@@ -283,10 +394,27 @@ static void remove_tiny_components(std::vector<uint8_t>& mask, int width, int he
                 const int nx = px + dx, ny = py + dy;
                 if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
                 const size_t next = static_cast<size_t>(ny) * width + nx;
-                if (mask[next] == 1 && !visited[next]) { visited[next] = 1; component.push_back(static_cast<uint32_t>(next)); }
+                if (mask[next] != 0 && !visited[next]) { visited[next] = 1; component.push_back(static_cast<uint32_t>(next)); }
             }
         }
-        if (component.size() <= 2) for (uint32_t pos : component) mask[pos] = 0;
+        if (component.size() == 1) mask[component.front()] = 0;
+        else if (component.size() == 2) tiny_pixels.insert(tiny_pixels.end(), component.begin(), component.end());
+        else for (uint32_t pos : component) mask[pos] = 2;
+    }
+
+    // Small paired marks close to substantial glyph components are often
+    // Ethiopic diacritics; a detached singleton is more likely scan dust. The
+    // original grayscale pixels remain in the padded crop either way.
+    const int mark_radius = std::clamp(std::min(width, height) / 140, 5, 12);
+    for (uint32_t pos : tiny_pixels) {
+        const int x = static_cast<int>(pos % static_cast<uint32_t>(width));
+        const int y = static_cast<int>(pos / static_cast<uint32_t>(width));
+        bool near_glyph = false;
+        for (int yy = std::max(0, y - mark_radius); yy <= std::min(height - 1, y + mark_radius) && !near_glyph; ++yy)
+            for (int xx = std::max(0, x - mark_radius); xx <= std::min(width - 1, x + mark_radius); ++xx)
+                if (mask[static_cast<size_t>(yy) * width + xx] == 2) { near_glyph = true; break; }
+        if (!near_glyph) mask[pos] = 0;
+        else mask[pos] = 1;
     }
 }
 
@@ -388,7 +516,7 @@ static int component_count(const std::vector<uint8_t>& mask, int w, int x0, int 
     return count;
 }
 
-static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int h) {
+static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int h, bool debug = false) {
     std::vector<uint32_t> rows(h, 0);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) rows[y] += mask[static_cast<size_t>(y) * w + x] != 0;
@@ -396,7 +524,30 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
     for (int y = 0; y < h; ++y) {
         for (int dy = -1; dy <= 1; ++dy) if (y + dy >= 0 && y + dy < h) smooth[y] += rows[y + dy];
     }
-    const int row_threshold = std::max(3, static_cast<int>(std::ceil(w * 0.004)));
+    std::vector<uint32_t> sorted_rows = rows;
+    std::nth_element(sorted_rows.begin(), sorted_rows.begin() + sorted_rows.size() / 2, sorted_rows.end());
+    const int median_row_ink = static_cast<int>(sorted_rows[sorted_rows.size() / 2]);
+    const int occupied_rows = static_cast<int>(std::count_if(rows.begin(), rows.end(), [](uint32_t v) { return v > 0; }));
+    std::vector<uint32_t> active_rows;
+    active_rows.reserve(static_cast<size_t>(occupied_rows));
+    for (const uint32_t row_ink : rows) if (row_ink > 0) active_rows.push_back(row_ink);
+    int median_active_row_ink = 0;
+    if (!active_rows.empty()) {
+        const auto middle = active_rows.begin() + active_rows.size() / 2;
+        std::nth_element(active_rows.begin(), middle, active_rows.end());
+        median_active_row_ink = static_cast<int>(*middle);
+    }
+    const bool noise_limited_dense_page = h >= std::max(80, w / 16) && occupied_rows > h * 0.40 &&
+        median_row_ink >= std::max(4, w / 200) && median_row_ink <= w * 0.25;
+    const int dense_row_threshold = noise_limited_dense_page ? median_row_ink * 2 : 0;
+    const bool sparse_text_block = h >= std::max(120, w / 10) && occupied_rows > h * 0.35 &&
+        median_row_ink == 0 && median_active_row_ink >= 3;
+    const int sparse_row_threshold = sparse_text_block ? median_active_row_ink * 3 : 0;
+    const int row_threshold = std::max({3, static_cast<int>(std::ceil(w * 0.004)), dense_row_threshold, sparse_row_threshold});
+    if (debug)
+        std::cerr << "debug: line_rows width=" << w << " height=" << h << " occupied=" << occupied_rows
+                  << " median_ink=" << median_row_ink << " median_active_ink=" << median_active_row_ink
+                  << " row_threshold=" << row_threshold << "\n";
     std::vector<std::pair<int, int>> raw;
     for (int y = 0; y < h;) {
         if (smooth[y] < row_threshold) { ++y; continue; }
@@ -405,6 +556,11 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
         raw.emplace_back(start, y);
         ++y;
     }
+    if (debug) {
+        std::cerr << "debug: raw_row_runs=";
+        for (const auto& run : raw) std::cerr << "[" << run.first << "," << run.second + 1 << ")";
+        std::cerr << "\n";
+    }
     std::vector<int> heights;
     for (auto [a, b] : raw) if (b - a + 1 >= 3) heights.push_back(b - a + 1);
     int typical = 12;
@@ -412,14 +568,66 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
         std::sort(heights.begin(), heights.end());
         typical = heights[heights.size() / 2];
     }
-    const int merge_gap = std::clamp(static_cast<int>(std::lround(typical * 0.24)), 2, 14);
+    if (typical > h * 0.20) typical = std::max(8, h / 24);
+    std::vector<int> pitches;
+    for (size_t i = 1; i < raw.size(); ++i) {
+        const int pitch = (raw[i].first + raw[i].second - raw[i - 1].first - raw[i - 1].second) / 2;
+        if (pitch >= typical + std::max(2, typical / 3) && pitch <= typical * 5) pitches.push_back(pitch);
+    }
+    int line_pitch = typical * 2;
+    if (!pitches.empty()) {
+        std::nth_element(pitches.begin(), pitches.begin() + pitches.size() / 2, pitches.end());
+        line_pitch = pitches[pitches.size() / 2];
+    }
+    const bool compact_line_region = h < std::max(80, w / 16);
+    const int merge_gap = compact_line_region ? h :
+        std::clamp(static_cast<int>(std::lround(typical * 0.24)), 2, 14);
     std::vector<std::pair<int, int>> merged;
     for (auto run : raw) {
         if (!merged.empty() && run.first - merged.back().second - 1 <= merge_gap) merged.back().second = run.second;
         else merged.push_back(run);
     }
+    std::vector<std::pair<int, int>> refined;
+    const int low_ink_limit = std::max(2, median_active_row_ink / 8);
+    const int min_valley = std::max(1, typical / 12);
+    const int min_fragment_height = std::max(5, static_cast<int>(std::lround(typical * 0.58)));
+    const int oversized_limit = std::max(static_cast<int>(std::lround(typical * 2.0)),
+                                         static_cast<int>(std::lround(line_pitch * 1.85)));
+    for (const auto& run : merged) {
+        const int run_height = run.second - run.first + 1;
+        if (h < 80 || run_height <= oversized_limit) { refined.push_back(run); continue; }
+        int segment_start = run.first;
+        std::vector<std::pair<int, int>> pieces;
+        for (int y = run.first; y <= run.second;) {
+            if (rows[static_cast<size_t>(y)] > static_cast<uint32_t>(low_ink_limit)) { ++y; continue; }
+            const int gap_start = y;
+            while (y <= run.second && rows[static_cast<size_t>(y)] <= static_cast<uint32_t>(low_ink_limit)) ++y;
+            const int gap_end = y - 1;
+            if (gap_end - gap_start + 1 < min_valley) continue;
+            if (gap_start - segment_start >= min_fragment_height && run.second - gap_end >= min_fragment_height) {
+                pieces.emplace_back(segment_start, gap_start - 1);
+                segment_start = gap_end + 1;
+            }
+        }
+        if (pieces.empty() || (pieces.size() == 1 && pitches.empty())) refined.push_back(run);
+        else {
+            pieces.emplace_back(segment_start, run.second);
+            for (const auto& piece : pieces) {
+                if (!refined.empty() && piece.second - piece.first + 1 < min_fragment_height &&
+                    refined.back().second + min_valley >= piece.first)
+                    refined.back().second = piece.second;
+                else refined.push_back(piece);
+            }
+        }
+    }
+    if (debug) {
+        std::cerr << "debug: refined_row_runs=";
+        for (const auto& run : refined) std::cerr << "[" << run.first << "," << run.second + 1 << ")";
+        std::cerr << "\n";
+    }
+
     std::vector<Band> bands;
-    for (auto [y0, y1] : merged) {
+    for (auto [y0, y1] : refined) {
         const int bh = y1 - y0 + 1;
         if (bh < 2) continue;
         int x0 = w, x1 = -1;
@@ -428,12 +636,14 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
         for (int y = y0; y <= y1; ++y) for (int x = 0; x < w; ++x) {
             if (mask[static_cast<size_t>(y) * w + x]) { ++columns[x]; ++ink; }
         }
-        const int x_threshold = std::max(1, static_cast<int>(std::ceil(bh * 0.025)));
+        // Any supported foreground column matters: the small detached marks
+        // used in Ethiopic writing can occupy only a few pixels.
+        const int x_threshold = 1;
         for (int x = 0; x < w; ++x) if (columns[x] >= static_cast<uint32_t>(x_threshold)) { x0 = std::min(x0, x); x1 = std::max(x1, x); }
         if (x1 < x0 || ink < std::max<uint64_t>(8, static_cast<uint64_t>(w * 0.003))) continue;
         const int ncomp = component_count(mask, w, x0, y0, x1, y1);
         if (ncomp == 0) continue;
-        bands.push_back(Band{y0, y1, x0, x1, ink, ncomp, false});
+        bands.push_back(Band{y0, y1, x0, x1, ink, ncomp, false, false, 0, {}});
     }
     return bands;
 }
@@ -449,11 +659,11 @@ static void mark_likely_page_numbers(std::vector<Band>& bands, int w, int h, boo
         const auto& b = bands[i];
         const double bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
         const double center = (b.x0 + b.x1) / 2.0;
-        const bool compact = bw <= w * 0.16 && bh <= median_h * 1.28 && b.components <= 8;
+        const bool compact = bw <= w * 0.16 && bh <= std::max(median_h * 2.0, h * 0.025) && b.components <= 8;
         const bool centered_on_page = std::min({std::abs(center - w * 0.25),
                                                 std::abs(center - w * 0.50),
                                                 std::abs(center - w * 0.75)}) <= w * 0.11;
-        const bool lower_half = b.y0 >= h * 0.40;
+        const bool lower_half = b.y0 >= h * 0.65;
         bool terminal_in_lane = true;
         for (size_t j = 0; j < bands.size(); ++j) {
             if (i == j) continue;
@@ -469,9 +679,99 @@ static void mark_likely_page_numbers(std::vector<Band>& bands, int w, int h, boo
     }
 }
 
+static void mark_likely_nontext_fragments(std::vector<Band>& bands, int w, int h) {
+    for (auto& b : bands) {
+        const int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
+        if (bw <= 0 || bh <= 0) continue;
+        // Leave compact footer-like candidates to the existing page-number review rule.
+        const double center = (b.x0 + b.x1) / 2.0;
+        const bool footer_lane = std::min({std::abs(center - w * 0.25), std::abs(center - w * 0.50),
+                                           std::abs(center - w * 0.75)}) <= w * 0.11;
+        if (b.y0 >= h * 0.40 && bw <= w * 0.16 && b.components <= 8 && footer_lane) continue;
+        const bool touches_side = b.x0 <= w * 0.01 || b.x1 >= w * 0.99;
+        const bool side_scan_fragment = touches_side && bw <= w * 0.12 && bh >= std::max(8, static_cast<int>(h * 0.02));
+        const bool long_narrow_binding = bw <= w * 0.05 && bh >= h * 0.15 && bh >= bw * 4;
+        const bool thin_horizontal_rule = bh <= std::max(4, static_cast<int>(h * 0.005)) &&
+                                          bw >= w * 0.12 &&
+                                          (b.ink * 4 <= static_cast<uint64_t>(bw) ||
+                                           (b.components <= 2 && static_cast<double>(b.ink) >=
+                                            static_cast<double>(bw) * bh * 0.55));
+        const bool isolated_speck = bw <= w * 0.02 && bh <= h * 0.015 && b.components <= 3;
+        b.non_text_fragment = side_scan_fragment || long_narrow_binding || thin_horizontal_rule || isolated_speck;
+    }
+}
+
+static void merge_short_line_fragments(std::vector<Band>& bands, int height) {
+    std::vector<int> typical_candidates;
+    for (const auto& b : bands) {
+        if (b.non_text_fragment || b.page_number) continue;
+        const int bh = b.y1 - b.y0 + 1;
+        if (bh >= 8 && bh <= height * 0.08) typical_candidates.push_back(bh);
+    }
+    int typical_height = 12;
+    if (!typical_candidates.empty()) {
+        auto middle = typical_candidates.begin() + typical_candidates.size() / 2;
+        std::nth_element(typical_candidates.begin(), middle, typical_candidates.end());
+        typical_height = *middle;
+    }
+    const int fragment_height = std::max(4, static_cast<int>(std::lround(typical_height * 0.55)));
+    const int fragment_gap = std::max(3, static_cast<int>(std::lround(typical_height * 0.75)));
+    std::stable_sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) {
+        if (a.region != b.region) return a.region < b.region;
+        if (a.y0 != b.y0) return a.y0 < b.y0;
+        return a.x0 < b.x0;
+    });
+    for (size_t i = 0; i + 1 < bands.size();) {
+        auto& a = bands[i];
+        auto& b = bands[i + 1];
+        const int ah = a.y1 - a.y0 + 1, bh = b.y1 - b.y0 + 1;
+        const int aw = a.x1 - a.x0 + 1, bw = b.x1 - b.x0 + 1;
+        const int gap = b.y0 - a.y1 - 1;
+        const int overlap = std::max(0, std::min(a.x1, b.x1) - std::max(a.x0, b.x0) + 1);
+        const double overlap_ratio = static_cast<double>(overlap) / std::max(1, std::min(aw, bw));
+        const bool join = a.region == b.region && !a.non_text_fragment && !b.non_text_fragment &&
+            !a.page_number && !b.page_number && ah <= fragment_height && bh <= fragment_height &&
+            gap >= 0 && gap <= fragment_gap && overlap_ratio >= 0.60 &&
+            b.y1 - a.y0 + 1 <= typical_height * 1.5;
+        if (!join) { ++i; continue; }
+        a.x0 = std::min(a.x0, b.x0); a.y0 = std::min(a.y0, b.y0);
+        a.x1 = std::max(a.x1, b.x1); a.y1 = std::max(a.y1, b.y1);
+        a.ink += b.ink; a.components += b.components;
+        bands.erase(bands.begin() + static_cast<std::ptrdiff_t>(i + 1));
+    }
+}
+
+static void mark_uncertain_bands(std::vector<Band>& bands, int width, int height) {
+    int typical_height = 12;
+    std::vector<int> heights;
+    for (const auto& b : bands) {
+        if (b.non_text_fragment || b.page_number) continue;
+        const int bh = b.y1 - b.y0 + 1;
+        if (bh >= 4 && bh <= height * 0.08) heights.push_back(bh);
+    }
+    if (!heights.empty()) {
+        std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
+        typical_height = heights[heights.size() / 2];
+    }
+    const int oversized = std::max(static_cast<int>(std::lround(typical_height * 1.8)),
+                                   static_cast<int>(std::lround(height * 0.025)));
+    const int edge_x = std::max(2, static_cast<int>(std::lround(width * 0.015)));
+    const int edge_y = std::max(2, static_cast<int>(std::lround(height * 0.04)));
+    for (auto& b : bands) {
+        if (b.non_text_fragment || b.page_number) continue;
+        const int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
+        if (bh > oversized) b.review_reasons.emplace_back("possible_merged_or_oversized_line");
+        if (bw < width * 0.16 && b.components <= 5)
+            b.review_reasons.emplace_back("short_or_fragmentary_text_candidate");
+        if (b.x0 <= edge_x || b.y0 <= edge_y || b.x1 >= width - edge_x || b.y1 >= height - edge_y)
+            b.review_reasons.emplace_back("possible_page_edge_clipping");
+    }
+}
+
 static Image crop_with_white_padding(const Image& gray, const Band& b) {
     const int line_h = b.y1 - b.y0 + 1;
-    const int pad_y = std::max(2, static_cast<int>(std::lround(line_h * 0.14)));
+    // Detached Ethiopic marks often sit above or below the main glyph bodies.
+    const int pad_y = std::max(3, static_cast<int>(std::lround(line_h * 0.55)));
     const int pad_x = std::max(4, static_cast<int>(std::lround(line_h * 0.18)));
     const int x0 = std::max(0, b.x0 - pad_x), x1 = std::min(gray.width - 1, b.x1 + pad_x);
     const int y0 = std::max(0, b.y0 - pad_y), y1 = std::min(gray.height - 1, b.y1 + pad_y);
@@ -531,7 +831,7 @@ static Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::cout << "linecrop 0.2.0\n"; std::exit(0); }
+        if (arg == "--version") { std::cout << "linecrop 0.3.0\n"; std::exit(0); }
         else if (arg == "--no-deskew") o.deskew = false;
         else if (arg == "--keep-page-numbers") o.filter_page_number = false;
         else if (arg == "--debug") o.debug = true;
@@ -562,18 +862,69 @@ int main(int argc, char** argv) {
         const auto loaded = std::chrono::steady_clock::now();
         require(original.width > 0 && original.height > 0, "empty image");
         require(original.pixels.size() <= MAX_PIXELS, "image exceeds the 100-megapixel safety limit");
-        auto mask = threshold_image(original, opt.debug);
+        const Image normalized = flatten_illumination(original, opt.debug);
+        auto mask = threshold_image(normalized, opt.debug);
         const auto thresholded = std::chrono::steady_clock::now();
-        auto ink_count = [&]() { return static_cast<uint64_t>(std::count(mask.begin(), mask.end(), static_cast<uint8_t>(1))); };
+        auto ink_count = [&]() { return static_cast<uint64_t>(std::count_if(mask.begin(), mask.end(), [](uint8_t v) { return v != 0; })); };
         if (opt.debug) std::cerr << "debug: threshold_foreground=" << ink_count() << "\n";
         suppress_page_rules(mask, original.width, original.height);
         const uint64_t after_rules = opt.debug ? ink_count() : 0;
         remove_tiny_components(mask, original.width, original.height);
         if (opt.debug) std::cerr << "debug: after_rule_suppression=" << after_rules << " after_noise_filter=" << ink_count() << "\n";
-        const double angle = opt.deskew ? estimate_deskew(mask, original.width, original.height) : 0.0;
+        if (opt.debug) {
+            const int center_begin = original.width * 35 / 100, center_end = original.width * 65 / 100;
+            int exact_begin = -1, exact_best = 0, exact_best_begin = -1;
+            int low_begin = -1, low_best = 0, low_best_begin = -1;
+            int exact_run = 0, low_run = 0;
+            for (int x = center_begin; x < center_end; ++x) {
+                uint64_t count = 0;
+                for (int y = 0; y < original.height; ++y)
+                    count += mask[static_cast<size_t>(y) * original.width + x] != 0;
+                if (count == 0) {
+                    if (!exact_run) exact_begin = x;
+                    ++exact_run;
+                    if (exact_run > exact_best) { exact_best = exact_run; exact_best_begin = exact_begin; }
+                }
+                else exact_run = 0;
+                if (count <= static_cast<uint64_t>(original.height / 100)) {
+                    if (!low_run) low_begin = x;
+                    ++low_run;
+                    if (low_run > low_best) { low_best = low_run; low_best_begin = low_begin; }
+                }
+                else low_run = 0;
+            }
+            const LayoutRegion whole{0, 0, original.width, original.height};
+            const int left_runs = exact_best_begin >= 0
+                ? lineforge_layout::active_row_runs(mask, original.width, whole, 0, exact_best_begin) : 0;
+            const int right_runs = exact_best_begin >= 0
+                ? lineforge_layout::active_row_runs(mask, original.width, whole, exact_best_begin + exact_best, original.width) : 0;
+            std::cerr << "debug: center_exact_gap=[" << exact_best_begin << "," << exact_best_begin + exact_best
+                      << ") width=" << exact_best << " low_ink_gap=[" << low_best_begin << "," << low_best_begin + low_best
+                      << ") width=" << low_best << " active_runs=" << left_runs << "," << right_runs
+                      << " threshold_per_column=" << original.height / 100 << "\n";
+        }
+        bool preserve_vertical_gutter = false;
+        lineforge_layout::Cut pre_deskew_cut;
+        if (opt.deskew && opt.layout == "auto" && opt.custom_regions.empty()) {
+            pre_deskew_cut = lineforge_layout::find_cut(
+                mask, original.width, LayoutRegion{0, 0, original.width, original.height}, original.height);
+            preserve_vertical_gutter = pre_deskew_cut.found && pre_deskew_cut.vertical;
+        }
+        const double angle = opt.deskew && !preserve_vertical_gutter
+            ? estimate_deskew(mask, original.width, original.height) : 0.0;
         const auto deskewed = std::chrono::steady_clock::now();
         Image processed = rotate_gray(original, angle);
         if (std::abs(angle) >= 1e-8) mask = rotate_mask(mask, original.width, original.height, angle);
+
+        if (opt.debug && opt.layout == "auto" && opt.custom_regions.empty()) {
+            const auto cut = lineforge_layout::find_cut(
+                mask, processed.width, LayoutRegion{0, 0, processed.width, processed.height}, processed.height);
+            std::cerr << "debug: gutter_pre_deskew="
+                      << (pre_deskew_cut.found ? (pre_deskew_cut.vertical ? "vertical" : "horizontal") : "none")
+                      << "[" << pre_deskew_cut.begin << "," << pre_deskew_cut.end << "] post_deskew="
+                      << (cut.found ? (cut.vertical ? "vertical" : "horizontal") : "none")
+                      << "[" << cut.begin << "," << cut.end << "]\n";
+        }
 
         std::vector<LayoutRegion> regions;
         std::string layout_name = opt.custom_regions.empty() ? opt.layout : "custom";
@@ -607,7 +958,7 @@ int main(int argc, char** argv) {
                 const auto source = mask.begin() + static_cast<size_t>(r.y0 + y) * processed.width + r.x0;
                 std::copy_n(source, rw, local_mask.begin() + static_cast<size_t>(y) * rw);
             }
-            auto local_bands = find_bands(local_mask, rw, rh);
+            auto local_bands = find_bands(local_mask, rw, rh, opt.debug);
             for (auto& b : local_bands) {
                 b.x0 += r.x0; b.x1 += r.x0;
                 b.y0 += r.y0; b.y1 += r.y0;
@@ -616,12 +967,21 @@ int main(int argc, char** argv) {
             lines_per_region[region_index] = local_bands.size();
             bands.insert(bands.end(), local_bands.begin(), local_bands.end());
         }
+        if (opt.custom_regions.empty() && opt.layout == "auto")
+            mark_likely_nontext_fragments(bands, processed.width, processed.height);
+        merge_short_line_fragments(bands, processed.height);
+        std::fill(lines_per_region.begin(), lines_per_region.end(), 0);
+        for (const auto& b : bands)
+            if (b.region > 0 && static_cast<size_t>(b.region) <= lines_per_region.size())
+                ++lines_per_region[static_cast<size_t>(b.region - 1)];
         mark_likely_page_numbers(bands, processed.width, processed.height, opt.filter_page_number);
+        mark_uncertain_bands(bands, processed.width, processed.height);
         const auto segmented = std::chrono::steady_clock::now();
         if (opt.debug) {
             std::cerr << "debug: deskew_degrees=" << angle << " layout=" << layout_name
                       << " reading_order=" << reading_order_name << " regions=" << regions.size()
-                      << " detected_bands=" << bands.size() << "\n";
+                      << " detected_bands=" << bands.size()
+                      << " preserve_vertical_gutter=" << (preserve_vertical_gutter ? "true" : "false") << "\n";
             for (size_t i = 0; i < regions.size(); ++i) {
                 const auto& r = regions[i];
                 std::cerr << "debug: region=" << i + 1 << " bbox=[" << r.x0 << "," << r.y0 << ","
@@ -631,7 +991,7 @@ int main(int argc, char** argv) {
         fs::create_directories(opt.output);
         std::ofstream manifest(fs::path(opt.output) / "manifest.json");
         require(manifest.good(), "cannot create manifest in output directory");
-        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"0.2.0\",\n";
+        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"0.3.0\",\n";
         manifest << "  \"input\": \"" << json_escape(fs::path(opt.input).filename().string()) << "\",\n";
         manifest << "  \"image_size\": {\"width\": " << processed.width << ", \"height\": " << processed.height << "},\n";
         manifest << "  \"deskew_correction_degrees\": " << std::fixed << std::setprecision(3) << angle << ",\n";
@@ -647,23 +1007,30 @@ int main(int argc, char** argv) {
         manifest << "]},\n  \"page_number_filter\": \"conservative geometric heuristic; manually review\",\n  \"lines\": [\n";
         size_t kept = 0, skipped = 0;
         for (const auto& b : bands) {
-            if (b.page_number) { ++skipped; continue; }
+            if (b.page_number || b.non_text_fragment) { ++skipped; continue; }
             const std::string name = "line_" + (kept + 1 < 10 ? std::string("000") : kept + 1 < 100 ? std::string("00") : kept + 1 < 1000 ? std::string("0") : std::string()) + std::to_string(kept + 1) + ".png";
             Image crop = crop_with_white_padding(processed, b);
             write_png_gray(fs::path(opt.output) / name, crop);
             if (kept) manifest << ",\n";
             manifest << "    {\"file\": \"" << name << "\", \"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
                      << "], \"crop_size\": [" << crop.width << ", " << crop.height << "], \"ink_pixels\": " << b.ink
-                     << ", \"region\": " << b.region << "}";
+                     << ", \"region\": " << b.region << ", \"review_required\": "
+                     << (b.review_reasons.empty() ? "false" : "true") << ", \"review_reasons\": [";
+            for (size_t i = 0; i < b.review_reasons.size(); ++i) {
+                if (i) manifest << ", ";
+                manifest << "\"" << b.review_reasons[i] << "\"";
+            }
+            manifest << "]}";
             ++kept;
         }
         manifest << "\n  ],\n  \"excluded\": [";
         bool first = true;
-        for (const auto& b : bands) if (b.page_number) {
+        for (const auto& b : bands) if (b.page_number || b.non_text_fragment) {
             if (!first) manifest << ", ";
             first = false;
+            const char* reason = b.page_number ? "likely_centered_page_number" : "likely_non_text_fragment";
             manifest << "{\"bbox_xyxy\": [" << b.x0 << ", " << b.y0 << ", " << b.x1 + 1 << ", " << b.y1 + 1
-                     << "], \"reason\": \"likely_centered_page_number\", \"review\": true, \"region\": " << b.region << "}";
+                     << "], \"reason\": \"" << reason << "\", \"review\": true, \"review_required\": true, \"region\": " << b.region << "}";
         }
         manifest << "],\n  \"detected_bands\": " << bands.size() << "\n}\n";
         manifest.close();
@@ -676,7 +1043,7 @@ int main(int argc, char** argv) {
                       << " output=" << ms(segmented, end) << "\n";
         }
         const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
-        std::cout << "lines=" << kept << " excluded_candidates=" << skipped << " deskew_degrees=" << angle
+        std::cout << "linecrop 0.3.0 lines=" << kept << " excluded_candidates=" << skipped << " deskew_degrees=" << angle
                   << " elapsed_ms=" << std::fixed << std::setprecision(2) << ms << " output=" << opt.output << "\n";
         return kept ? 0 : 2;
     } catch (const std::exception& e) {

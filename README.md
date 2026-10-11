@@ -2,22 +2,24 @@
 
 A fast, deterministic C++ command-line tool that turns a scanned page image into ordered grayscale line crops for OCR dataset preparation. It targets Amharic/Ethiopic documents but does not depend on the script or read/transcribe the words.
 
-**This is a new project, not OCR-ALIGNER.** Proposed public repository name: `lineforge-cpp`.
+**This is a new project, not OCR-ALIGNER.** Public repository: [`nexuss0781/lineforge-cpp`](https://github.com/nexuss0781/lineforge-cpp).
 
 ## What it does
 
 - Reads JPEG and PNG pages and writes one PNG per detected text line.
-- Uses local-contrast thresholding with an Otsu-derived guard, horizontal projection bands, tight ink bounds, and small white safety borders.
-- Estimates mild page skew (search range ±5°) and deskews the page before finding bands.
-- Automatically separates text regions using recursive whitespace (XY-cut) analysis, so facing-page spreads, multi-column pages, and mixed newspaper blocks can be segmented in reading order.
+- Flattens slowly varying or colored illumination before adaptive local-contrast thresholding, with an Otsu-derived guard.
+- Combines text-region analysis, local row projections, low-density valleys, connected components, and observed line spacing to split dense blocks into lines.
+- Removes isolated scan specks while retaining small multi-pixel marks near glyphs; grayscale crops include extra space for detached Ethiopic marks.
+- Estimates mild page skew (search range ±5°) and deskews before layout and line analysis.
+- Separates text regions using recursive whitespace (XY-cut) analysis, so facing-page spreads, multi-column pages, and mixed newspaper blocks can be segmented in reading order.
 - Supports explicit, ordered rectangular regions for unusual/custom page designs and a left-to-right or right-to-left automatic column order.
-- Suppresses long vertical page-edge rules from segmentation.
-- Can conservatively flag isolated compact lower-page numbers centered on a page or spread leaf; every such exclusion is listed for human review in `manifest.json`.
+- Conservatively identifies centered lower-page number candidates and thin non-text fragments; excluded candidates remain in the manifest for review.
+- Marks kept crops that appear oversized, merged, fragmented, or close to a page edge with `review_required` and `review_reasons` metadata.
 - Preserves the grayscale source pixels in each crop (except optional deskew interpolation); it does not invent or alter transcription labels.
 
 ## Build
 
-Dependencies: C++17 compiler, CMake 3.16+, libjpeg-turbo/libjpeg development headers, libpng development headers, and Python 3 + Pillow for the synthetic benchmark.
+Dependencies: C++17 compiler, CMake 3.16+, libjpeg-turbo/libjpeg development headers, libpng development headers, and Python 3 + Pillow for the synthetic benchmark. The hand-label evaluator and its unit tests use only the Python standard library.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -38,24 +40,32 @@ Options:
 - Repeat `--region x0,y0,x1,y1` to provide custom rectangular regions in the exact order they should be read. Coordinates are half-open `[x0,y0,x1,y1]` on the internally deskewed page; regions must be in bounds and must not overlap. When supplied, custom regions take precedence over `--layout` and their command-line order is used.
 - `--no-deskew` skips skew estimation/correction.
 - `--keep-page-numbers` disables the conservative footer-number filter.
-- `--debug` prints intermediate foreground counts and per-stage timings to standard error.
+- `--debug` prints intermediate foreground counts, row-run diagnostics, and per-stage timings to standard error.
 - `--version` prints the engine version.
 
-Outputs are `line_0001.png`, `line_0002.png`, … and `manifest.json`. The manifest records the processed-page bounding boxes, crop dimensions, ink-pixel counts, estimated correction angle, detected layout regions, each line's region ID, and any excluded candidates. Bounding boxes use half-open coordinates `[x0, y0, x1, y1]` on the internally deskewed page. Automatic crops follow the recursive layout order (default: columns left-to-right, blocks top-to-bottom); custom-region crops follow the order supplied on the command line.
+Outputs are `line_0001.png`, `line_0002.png`, … and `manifest.json`. The manifest records processed-page bounding boxes, crop dimensions, ink-pixel counts, estimated correction angle, detected layout regions, each line's region ID, uncertainty flags/reasons, and excluded candidates. Bounding boxes use half-open coordinates `[x0, y0, x1, y1]` on the internally deskewed page. Automatic crops follow the recursive layout order (default: columns left-to-right, blocks top-to-bottom); custom-region crops follow the order supplied on the command line.
 
-## Validation and accuracy claims
+## Validation
 
-`tests/benchmark.py` runs 38 checks: 24 synthetic pages (clean, low contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and—when Noto Ethiopic fonts are installed—rendered Ethiopic text; three seeds per condition), two uniform blank-page rejection cases, one 15.5-megapixel throughput case, four CLI/error-path checks, and seven layout-specific cases covering spreads, two-column LTR/RTL order, a mixed newspaper layout, custom regions, the single-region override, and invalid region bounds. It checks line count/order, crop size/width, output files, footer-number filtering, skew-estimate magnitude, layout metadata, version reporting, and invalid-input handling. This is a reproducible geometry stress test, **not** a human-annotated real-world segmentation accuracy benchmark, OCR evaluation, or evidence of 100% accuracy. The uploaded example page is not redistributed in this repository; validate locally on your own representative pages.
+`tests/benchmark.py` runs **40 deterministic synthetic checks**: 24 pages (clean, low contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font/pseudo-Ethiopic text; three seeds per condition), two blank-page rejection cases, one 15.5-megapixel throughput case, a sparse row-noise case, a heading/underline/detached-mark/speck/footer case, four CLI/error-path checks, and seven layout-specific cases. It checks line count/order, crop size and files, footer handling, line repair, skew estimates, layout metadata, reading order, version reporting, and invalid-input handling. These tests are reproducible geometry stress tests, **not** a human-annotated accuracy benchmark or OCR evaluation.
 
-No claim of perfect segmentation is made. The page-number decision is intentionally a geometry heuristic, not OCR, and can mistake a short centered footer/caption for a page number or miss a page number placed away from the lower center. Review every `excluded` manifest entry and inspect crops before training. For sensitive/high-value corpora, keep the original page, use a held-out set with human-annotated line boxes, and measure line-detection precision/recall before bulk processing.
+A separate evaluator scores manifests against hand-labeled line boxes. Example:
 
-## Current limitations
+```sh
+python3 tests/real_page_eval.py \
+  --annotations labels.json \
+  --output-json report.json
+```
 
-- Automatic layout detection is whitespace-heuristic based. Complex overlapping articles, pages with few/no visible gutters, tables, marginalia, and irregular newspaper designs may need explicit `--region` rectangles and visual review. It does not detect handwriting, curved baselines, or text rotated 90°.
-- Deskew is limited to mild skew (±5°); perspective and page-warp correction are out of scope.
-- Adaptive thresholding supports uneven illumination but cannot recover missing or blurred source detail.
-- Line crops are not matched to ground-truth text. Create and proofread one exact UTF-8 transcription per crop separately.
-- Large images are limited to 100 megapixels to prevent accidental memory exhaustion.
+The input JSON contains `iou_threshold` (default `0.5`) and a `pages` array. Each page supplies a `manifest` path, `ground_truth_xyxy` boxes, and optionally an `roi_xyxy` region. Coordinates use the same half-open `xyxy` convention as the manifest. When an ROI is supplied, predicted boxes are included only when their centers fall inside it. The evaluator performs greedy one-to-one IoU matching and reports precision, recall, false positives, missed lines, cut-line indicators, merged crops, and split lines. A cut-line indicator is raised when an overlapping crop covers under 80% of a labeled line's width or under 50% of its height; merged/split counts use 20% overlap heuristics. Excluded candidates are not included in the predicted-crop count.
+
+Label representative, held-out pages and ROIs; review overlay imagery; report the sample size and its scope. A score from a few selected blocks must not be generalized to every page or layout.
+
+## Accuracy and limitations
+
+No claim of perfect segmentation is made. The page-number decision is a geometry heuristic, not OCR, and can mistake a short centered footer/caption for a page number or miss a number away from the lower center. Complex overlapping articles, weak/absent gutters, tables, marginalia, decorative covers, and irregular newspaper designs may produce false positives or require explicit `--region` rectangles and visual review. Inspect `review_required` crops and every `excluded` manifest entry before bulk processing.
+
+Deskew is limited to mild skew (±5°); perspective and page-warp correction are out of scope. Adaptive thresholding can compensate for uneven illumination but cannot recover missing or blurred source detail. Line crops are not matched to ground-truth text; create and proofread one exact UTF-8 transcription per crop separately. Large images are limited to 100 megapixels to prevent accidental memory exhaustion.
 
 ## License
 

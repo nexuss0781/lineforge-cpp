@@ -52,19 +52,23 @@ inline int active_row_runs(const std::vector<uint8_t>& mask, int image_width,
 
 inline Cut widest_empty_cut(const std::vector<uint64_t>& projection,
                             int start, int end, int min_width,
-                            bool vertical, uint64_t total_ink) {
+                            bool vertical, uint64_t total_ink,
+                            uint64_t max_occupancy = 0,
+                            int search_start = -1, int search_end = -1) {
     Cut best;
     const int side_guard = std::max(2, (end - start) / 100);
+    const int scan_start = std::clamp(search_start < 0 ? start : search_start, start, end);
+    const int scan_end = std::clamp(search_end < 0 ? end : search_end, scan_start, end);
     std::vector<uint64_t> prefix(projection.size() + 1, 0);
     for (size_t i = 0; i < projection.size(); ++i)
         prefix[i + 1] = prefix[i] + projection[i];
-    for (int i = start + side_guard; i < end - side_guard;) {
-        if (projection[static_cast<size_t>(i)] != 0) {
+    for (int i = scan_start + side_guard; i < scan_end - side_guard;) {
+        if (projection[static_cast<size_t>(i)] > max_occupancy) {
             ++i;
             continue;
         }
         const int gap_begin = i;
-        while (i < end - side_guard && projection[static_cast<size_t>(i)] == 0) ++i;
+        while (i < scan_end - side_guard && projection[static_cast<size_t>(i)] <= max_occupancy) ++i;
         const int gap_end = i;
         const int gap_width = gap_end - gap_begin;
         if (gap_width < min_width || gap_begin <= start || gap_end >= end) continue;
@@ -101,21 +105,6 @@ inline Cut find_cut(const std::vector<uint8_t>& mask, int image_width,
     // Detect a column gutter before paragraph/line spacing. This makes a book or
     // newspaper page column-major in reading order even when lines align by row.
     const int region_width = r.x1 - r.x0;
-    const int vertical_min = std::max(20, region_width / 40);
-    Cut vertical = widest_empty_cut(columns, 0, region_width, vertical_min, true, ink);
-    if (vertical.found) {
-        vertical.begin += r.x0;
-        vertical.end += r.x0;
-        // Word spaces can be wider than a font-specific gutter on a single
-        // baseline. A real text-column boundary normally has text on both
-        // sides across multiple line rows.
-        if (active_row_runs(mask, image_width, r, r.x0, vertical.begin) >= 2 &&
-            active_row_runs(mask, image_width, r, vertical.end, r.x1) >= 2)
-            return vertical;
-    }
-
-    // Horizontal cuts are intentionally more conservative than line finding.
-    // They split wide blank gutters between panels/articles, not ordinary line gaps.
     const int region_height = r.y1 - r.y0;
     const int horizontal_min = std::max(18, page_height / 70);
     Cut horizontal = widest_empty_cut(rows, 0, region_height, horizontal_min, false, ink);
@@ -123,6 +112,54 @@ inline Cut find_cut(const std::vector<uint8_t>& mask, int image_width,
         horizontal.begin += r.y0;
         horizontal.end += r.y0;
     }
+
+    const int vertical_min = std::max(36, region_width / 20);
+    Cut vertical = widest_empty_cut(columns, 0, region_width, vertical_min, true, ink);
+    if (vertical.found) {
+        vertical.begin += r.x0;
+        vertical.end += r.x0;
+        // Word spaces can be wider than a font-specific gutter on a single
+        // baseline. A real text-column boundary normally has text on both
+        // sides across multiple line rows.
+        const int left_runs = active_row_runs(mask, image_width, r, r.x0, vertical.begin);
+        const int right_runs = active_row_runs(mask, image_width, r, vertical.end, r.x1);
+        const double cut_center = (vertical.begin + vertical.end) / 2.0;
+        const bool well_supported = left_runs >= 2 && right_runs >= 2;
+        const bool wide_center_gutter = vertical.width >= region_width * 0.04 &&
+            std::abs(cut_center - (r.x0 + r.x1) / 2.0) <= region_width * 0.08 &&
+            left_runs >= 1 && right_runs >= 1;
+        if (well_supported || wide_center_gutter)
+            return vertical;
+    }
+
+    // A spine can be interrupted by text, softened by thresholding, or slant
+    // through a few columns after deskew. On a full-width region only, permit a
+    // low-ink (not necessarily perfectly empty) center gutter. The narrower
+    // center search and multi-row support protect ordinary word spaces.
+    if (region_width >= image_width * 0.70 &&
+        active_row_runs(mask, image_width, r, r.x0, r.x1) >= 6) {
+        const int center_min = std::max(6, region_width / 160);
+        const uint64_t center_tolerance = std::max<uint64_t>(1, static_cast<uint64_t>(r.y1 - r.y0) / 100);
+        Cut centered = widest_empty_cut(columns, 0, region_width, center_min, true, ink,
+                                         center_tolerance, region_width * 47 / 100,
+                                         region_width * 53 / 100);
+        if (centered.found) {
+            centered.begin += r.x0;
+            centered.end += r.x0;
+            if (active_row_runs(mask, image_width, r, r.x0, centered.begin) >= 2 &&
+                active_row_runs(mask, image_width, r, centered.end, r.x1) >= 2) {
+                const double vertical_fraction = static_cast<double>(centered.width) / std::max(1, region_width);
+                const double horizontal_fraction = horizontal.found
+                    ? static_cast<double>(horizontal.width) / std::max(1, region_height) : 0.0;
+                if (horizontal.found && horizontal_fraction > vertical_fraction * 2.0)
+                    return horizontal;
+                return centered;
+            }
+        }
+    }
+
+    // Horizontal cuts are intentionally more conservative than line finding.
+    // They split wide blank gutters between panels/articles, not ordinary line gaps.
     return horizontal;
 }
 

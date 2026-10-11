@@ -1,21 +1,47 @@
 # Benchmark and validation record
 
 **Run date:** 2026-10-11
+
+**Engine:** `linecrop 0.3.0`
+
 **Build:** Release, GCC 13.3.0, CMake, Ubuntu 24.04
-**Benchmark command:** `python3 tests/benchmark.py --binary build/linecrop --work-dir build/benchmark-pages --output-json build/benchmark-report.json`
+**Synthetic command:** `python3 tests/benchmark.py --binary build/linecrop --work-dir build/benchmark-pages --output-json build/benchmark-final.json`
 
 ## Results
 
-- **38/38 checks passed**: 24 synthetic pages (clean, low contrast, gradient-lit, noise, blur, JPEG, skew, and Ethiopic-font fixtures; three seeds each), two blank-page checks, one 3600×4320 (15.55 MP) throughput case, four CLI/error-path checks, and seven layout-specific checks.
-- Layout fixtures verified facing-page spreads, two-column left-to-right and right-to-left ordering, a mixed newspaper page with a full-width headline, explicitly ordered custom regions, the single-region override, and rejection of an out-of-bounds custom region.
-- **CTest:** 1/1 test passed; the registered test runs the same 38-case suite.
-- On this run, cases had **73.05 ms median**, **116.25 ms p95**, and **3.44 s summed process time**. The 15.55 MP page took **850.93 ms** end-to-end.
-- AddressSanitizer and UndefinedBehaviorSanitizer full-suite run: **38/38 checks passed**, with leak detection enabled.
+| Evaluation | Result | Scope and qualification |
+| --- | --- | --- |
+| Synthetic geometry suite | **40/40 passed** | Deterministic fixtures, not real-world accuracy or OCR quality. |
+| CTest | **2/2 passed** | One 40-case geometry benchmark and four evaluator unit tests. |
+| Four hand-labeled real-page ROIs | **23/23 matched** at IoU ≥ 0.50; precision **1.00**, recall **1.00**, 0 missed, 0 cut indicators, 0 merged, 0 split | Small, selected text blocks across two scanned documents. This is not whole-page or corpus-wide accuracy. Ground-truth envelopes were estimated visually from enlarged source-only regions. |
+| Full second-document batch | **83 pages**, 3,815 crop candidates, 201 excluded candidates, 484 kept crops flagged for review | Candidate counts are not line-accuracy counts. The illustrated final cover remains noisy and needs human review. |
 
-## What was verified
+A separate AddressSanitizer/UndefinedBehaviorSanitizer build also passed both registered tests with leak detection enabled.
 
-Fixture assertions check retained line count, crop dimensions and output files, line and column reading order, region metadata, custom-region order, conservative page-number handling including both leaves of a spread, mild-skew estimates, blank-page rejection, CLI overrides, version output, invalid input, and region-bound validation. Both JPEG and PNG decoding were exercised.
+The four hand-labeled regions include upper paragraphs from two neighboring pages, a paragraph plus a centered heading on another page, and one paragraph in a two-page spread. The centered heading missed by the earlier threshold is now recovered; its underline is separately excluded and flagged for review. The perfect score applies only to those 23 selected boxes and must not be generalized to other regions or layouts.
 
-## Limits
+For the 83-page batch, the median processing time was **162 ms/page**, with **13.79 s** summed over page processing on this computer (PDF rasterization excluded). The illustrated final page generated 89 kept candidates, 51 of them marked `review_required`; this is an observed limitation, not a confirmed line count.
 
-These checks validate synthetic geometry only. They are **not** human-annotated page-level precision/recall, a broad real-world corpus benchmark, or OCR character/word accuracy. The automatic layout detector relies on whitespace gutters; overlapping articles, weak/absent gutters, tables, marginalia, and irregular layouts may require explicit regions and human review. Timings are from one local computer and are not a performance guarantee. Before production use, benchmark against representative held-out pages with human-annotated line boxes and separately validate exact transcripts.
+## Synthetic coverage and timing
+
+The 40 checks cover 24 pages (clean, low contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font or pseudo-Ethiopic text; three seeds per condition), two blank-page rejection cases, a 15.55-megapixel throughput case, a sparse row-noise case, a heading/underline/detached-mark/single-speck/footer case, four CLI/error-path cases, and seven layout cases. Layout fixtures verify spreads, two-column LTR/RTL ordering, a mixed newspaper headline, custom-region ordering, a single-region override, and invalid-region rejection.
+
+- **Per-case runtime:** 105.66 ms median, 143.28 ms p95, 4.97 s summed process time.
+- **15.55 MP case:** 1,238.40 ms end-to-end on this run.
+
+The suite checks crop geometry and files, retained line counts/order, footer handling, detached-mark crop retention, noise filtering, mild-skew estimates, layout metadata, region order, version output, and invalid-input handling. These synthetic geometry tests do not measure OCR character/word accuracy.
+
+## Implementation changes exercised
+
+- Flatten slowly varying/color illumination before local thresholding.
+- Combine local row profiles, low-density valleys, connected components, and line-spacing evidence to refine line bands.
+- Join tiny same-line row fragments without merging ordinary neighboring lines; preserve complete headings while separating thin underline artifacts.
+- Remove isolated single-pixel specks, retain small marks near glyphs, and keep additional grayscale padding around crops for detached Ethiopic marks.
+- Mark uncertain oversized/merged/fragmented/edge-adjacent crops for inspection; record exclusions for human review.
+- Evaluate line boxes against hand-labeled ROIs with one-to-one IoU matching and missed, cut, merged, and split counts.
+
+## Limits and reproducibility
+
+The real-page evaluation uses a small manually selected ROI sample; it does not claim 100% general accuracy. The 83-page batch reports candidate/review volume, not a true-line denominator. Illustrations, cover decoration, scan edges, weak gutters, and embedded artifacts can still create false positives. Inspect `review_required` crops and all `excluded` manifest entries before bulk processing. A broader held-out annotation set is needed for a defensible page-level accuracy estimate.
+
+PDFs, rasterized pages, crop images, overlays, and hand-label JSON used in the local evaluation were kept under the ignored `build/` directory and are not part of the public source payload.
