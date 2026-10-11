@@ -540,6 +540,24 @@ def make_layout_fixture(path, kind):
     im.save(path, "PNG")
 
 
+def make_gutter_bleed_fixture(path):
+    """Draw a facing spread with faint right-edge ink below the mask threshold."""
+    im = Image.new("L", (1600, 900), 255)
+    draw = ImageDraw.Draw(im)
+    for y in (150, 280, 410, 540, 670):
+        for page_x in (62, 1112):
+            for i in range(20):
+                x = page_x + 24 * i
+                draw.line((x, y + 5, x, y + 31), fill=12, width=3)
+                draw.line((x, y + 15, x + 18, y + 15), fill=12, width=3)
+                draw.line((x + 18, y + 5, x + 18, y + 31), fill=12, width=3)
+        # Visible in the grayscale source but intentionally absent from the
+        # foreground mask, simulating ink that fades into a scanned gutter.
+        draw.rectangle((546, y + 17, 557, y + 20), fill=180)
+    draw.line((800, 15, 800, 885), fill=0, width=10)
+    im.save(path, "PNG")
+
+
 def run_layout_case(binary, work, kind, reading_order="ltr"):
     source = work / f"layout_{kind}.png"
     out = work / f"out_layout_{kind}_{reading_order}"
@@ -587,6 +605,56 @@ def run_layout_case(binary, work, kind, reading_order="ltr"):
             "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
             "line_count": len(lines), "excluded_count": len(manifest["excluded"]),
             "region_count": len(manifest["layout"]["regions"])}
+
+
+def run_gutter_margin_case(binary, work):
+    source, out = work / "layout_gutter_bleed.png", work / "out_layout_gutter_bleed"
+    make_gutter_bleed_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "layout_gutter_bleed", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    width = manifest["image_size"]["width"]
+    left = [line for line in lines
+            if (line["bbox_xyxy"][0] + line["bbox_xyxy"][2]) / 2 < width / 2]
+    right = [line for line in lines
+             if (line["bbox_xyxy"][0] + line["bbox_xyxy"][2]) / 2 >= width / 2]
+    marker_counts = {line["file"]: Image.open(out / line["file"]).convert("L").histogram()[180]
+                     for line in lines}
+    left_end = max((line["bbox_xyxy"][2] for line in left), default=width)
+    right_start = min((line["bbox_xyxy"][0] for line in right), default=0)
+    gutter_midpoint = width // 2
+    crop_bounds_reported = all("source_crop_bbox_xyxy" in line for line in lines)
+    left_leaks = [line["file"] for line in left if crop_bounds_reported and
+                  line["source_crop_bbox_xyxy"][2] > right_start]
+    right_leaks = [line["file"] for line in right if crop_bounds_reported and
+                   line["source_crop_bbox_xyxy"][0] < left_end]
+    left_in_reading_order = len(left) == 5 and len(right) == 5 and all(
+        (line["bbox_xyxy"][0] + line["bbox_xyxy"][2]) / 2 < width / 2
+        for line in lines[:5])
+    checks = {
+        "ten_lines_separated_by_page": len(lines) == 10 and len(left) == 5 and len(right) == 5,
+        "left_to_right_page_order_preserved": left_in_reading_order,
+        "source_crop_bounds_reported": crop_bounds_reported,
+        "faint_gutter_tails_retained": all(marker_counts[line["file"]] == 48 for line in left),
+        "no_faint_tail_copied_to_opposite_page": all(marker_counts[line["file"]] == 0 for line in right),
+        "crop_windows_do_not_cross_gutter_midpoint": crop_bounds_reported and
+            all(line["source_crop_bbox_xyxy"][2] <= gutter_midpoint for line in left) and
+            all(line["source_crop_bbox_xyxy"][0] >= gutter_midpoint for line in right),
+        "no_crop_reaches_opposite_text_column": crop_bounds_reported and not left_leaks and not right_leaks,
+        "no_new_review_flags": all(not line["review_required"] for line in lines),
+        "no_footer_candidates_created": not manifest["excluded"],
+    }
+    return {"case": "layout_gutter_bleed", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "left_line_count": len(left), "right_line_count": len(right),
+            "cross_column_leaks": len(left_leaks) + len(right_leaks)}
 
 
 def run_custom_region_case(binary, work):
@@ -665,6 +733,7 @@ def main():
                        run_layout_case(args.binary.resolve(), work, "columns"),
                        run_layout_case(args.binary.resolve(), work, "columns", "rtl"),
                        run_layout_case(args.binary.resolve(), work, "newspaper"),
+                       run_gutter_margin_case(args.binary.resolve(), work),
                        run_custom_region_case(args.binary.resolve(), work),
                        run_single_layout_case(args.binary.resolve(), work),
                        run_bad_custom_region_case(args.binary.resolve(), work)))
@@ -684,6 +753,7 @@ def main():
                            run_layout_case(args.binary.resolve(), work, "columns"),
                            run_layout_case(args.binary.resolve(), work, "columns", "rtl"),
                            run_layout_case(args.binary.resolve(), work, "newspaper"),
+                           run_gutter_margin_case(args.binary.resolve(), work),
                            run_custom_region_case(args.binary.resolve(), work),
                            run_single_layout_case(args.binary.resolve(), work),
                            run_bad_custom_region_case(args.binary.resolve(), work)))
