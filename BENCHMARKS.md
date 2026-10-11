@@ -1,10 +1,50 @@
 # Benchmark and validation record
 
 **Run date:** 2026-10-11
-**Engine:** `linecrop 0.4.1`
+**Engine:** `linecrop 0.5.0`
 **Build:** Release, GCC 13.3.0, CMake, Ubuntu 24.04
+**Comparison baseline:** `3ac462cd4fe46373efa6637cecf979e17021cd12` (`linecrop 0.4.1`)
 
-## Results
+## 0.5.0 geometry-aware release audit
+
+| Validation | Result | Scope and qualification |
+| --- | --- | --- |
+| Synthetic geometry suite | **48/48 passed** | Includes a spanning newspaper headline over a partial curved gutter, irregular newspaper columns, variable-height baselines, a workbook-style mixed-content page with individually labeled handwriting-like answer strokes, ruled answer rows, crop containment, fallback behavior, and legacy regression cases. Synthetic only. |
+| Release CTest | **2/2 passed** | The 48-case synthetic suite and **11 real-page evaluator unit tests**. |
+| AddressSanitizer/UndefinedBehaviorSanitizer CTest | **2/2 passed** | Optimized `-O1` instrumented build; leak detection and halt-on-error enabled. |
+| Private held-out source audit | **32/32 labeled lines matched** at IoU ≥ 0.50; **150/150 word-like source-ink groups contained** | Four selected rasters from two private PDFs. Compared with the exact baseline: 27/32 line matches and 105/150 source-ink groups contained. This selected sample is not corpus-wide accuracy. |
+| Crop structure | **3 baseline merged crops → 0**; no cut/split indicators in the 32-label upgrade sample | The merges were on the dense sepia printed page. The upgraded row-valley split recovered all six independently labeled rows in that ROI. |
+| Region and reading-order checks | **0 region-assignment errors; 0 pairwise order violations** | 32 matched line labels, including both columns of one Amharic spread read right-to-left. |
+| Review workload | **0/29 baseline candidates flagged**, **0/32 upgraded candidates flagged** | Baseline's three measured merged crops were not surfaced for review. This small sample shows that the existing review flags did not detect those specific merges; it is not calibrated review recall. |
+| Upgrade manifest runtime | **221.440 ms mean; 212.913 ms median; 230.336 ms p95** | Four processed full-page scans. The baseline version did not record stage timings in its manifest, so no like-for-like runtime claim is made. |
+
+### Independent private-page comparison
+
+The audit used two rasters from the available 83-page Amharic scan (`a_20.png`, `a_43.png`) and two from the 278-page sepia scan (`b_26.png`, `b_140.png`). Independently selected source row bands were tightened against raw source pixels; this produced 32 line boxes and 150 word-like ink groups from horizontal source-ink runs. These are geometric ink annotations, **not** OCR tokens or transcription labels. The page subset includes a two-page spread, ordinary printed paragraphs, and a dense printed paragraph. The baseline and upgrade used `--no-deskew`; Amharic spread runs used `--reading-order rtl`.
+
+| Measure | Baseline 0.4.1 | Upgrade 0.5.0 |
+| --- | ---: | ---: |
+| Labeled lines | 32 | 32 |
+| Predicted crops | 29 | 32 |
+| One-to-one matches | 27/32 | **32/32** |
+| Precision / recall | 0.931 / 0.844 | **1.000 / 1.000** |
+| Merged crops | 3 | **0** |
+| Cut-line / split-line indicators | 0 / 0 | **0 / 0** |
+| Word-like source-ink groups fully inside matched source crops | 105/150 (70.0%) | **150/150 (100.0%)** |
+| Region assignment errors / reading-order violations | 0 / 0 | **0 / 0** |
+| Review candidates flagged | 0/29 | 0/32 |
+
+The 0.5.0 result is a strong pass on this small, selected sample—not a universal guarantee. In particular, baseline review flags did not catch its three measured merges. No real handwritten or exercise-book page was present in these PDFs; workbook and hand-drawn-like content are validated only by synthetic geometry tests. The private PDFs, rasters, crops, overlays, and annotation JSON remain outside this repository.
+
+### 0.5.0 changes exercised
+
+- Retained whitespace/XY-cut behavior while adding confidence-gated piecewise vertical boundary paths for smooth/partial curved gutters and preserving spanning text blocks.
+- Added an explicit `--layout baseline` fallback, region hierarchy/relations, sampled curved-edge provenance, and run-stage timings.
+- Re-estimated individual row height robustly when adjacent printed rows merge in the projection and split oversized bands at shallow local valleys.
+- Added a small source-crop safety overlap at tight vertical boundaries and widened gutter-facing safety expansion without crossing the midpoint cap; independent word-like ink containment increased from 105/150 to 150/150 in this sample.
+- Extended the workbook fixture to verify each generated handwriting-like answer stroke independently, alongside printed prompts and suppression of long answer rules.
+
+## Historical 0.4.1 and 0.4.0 results
 
 | Evaluation | Result | Scope and qualification |
 | --- | --- | --- |
