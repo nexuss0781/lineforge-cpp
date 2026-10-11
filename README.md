@@ -81,7 +81,7 @@ Deskew is limited to mild skew (±5°); perspective correction and arbitrary pag
 
 ## LineForge dataset preparation and dispatch
 
-The LineForge-owned dataset pipeline is documented in [`docs/dataset-pipeline.md`](docs/dataset-pipeline.md). It stages local PDFs, dispatches 19 LineForge worker processes plus one live coordinator on a single trusted runner, enforces an exact shared quota, and collects per-image provenance. It does not run OCR or training. The manual GitHub Action requires a configured dedicated runner and an approved local source manifest; it never downloads from Telegram or publishes to Hugging Face.
+The LineForge-owned dataset pipeline is documented in [`docs/dataset-pipeline.md`](docs/dataset-pipeline.md). It stages local PDFs, dispatches 19 LineForge worker processes plus one live coordinator on a single trusted runner, enforces an exact shared quota, and collects per-image provenance. It does not run OCR or training. The manual GitHub Action requires a configured dedicated runner and an approved local source manifest; its Hugging Face publisher is separately gated by a default-off manual input and fails closed until output integrity, per-source rights, and an explicit compatible dataset license are verified.
 
 ## License
 

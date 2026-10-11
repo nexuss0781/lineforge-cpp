@@ -3,7 +3,8 @@
 
 The pipeline stages local approved PDFs, dispatches 19 colocated worker processes,
 and runs one live coordinator against a shared SQLite quota ledger. It deliberately
-has no Telegram, cloud-storage, training, or active publication client.
+has no Telegram, cloud-storage, or training client. Hugging Face publication lives
+in a separate offline-preflight-first module with an explicit confirmation gate.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ ENGINE_VERSION = "lineforge-1.0.1"
 
 
 def require_hf_token() -> str:
-    """Return the configured HF_TOKEN for a future explicitly approved publisher."""
+    """Return HF_TOKEN only when the explicitly gated publisher requests it."""
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Hugging Face publication requires the HF_TOKEN environment variable")

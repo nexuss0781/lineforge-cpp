@@ -7,6 +7,11 @@ on:
         description: Private deterministic sampling seed for this approved run
         required: true
         type: string
+      publish_to_hf:
+        description: Publish the validated 100,024-image output to the configured public Hugging Face dataset
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -79,3 +84,41 @@ jobs:
             --target 100024 \
             --dpi 300 \
             --timeout-seconds 21600
+
+      - name: Install optional Hugging Face publisher dependencies
+        if: ${{ inputs.publish_to_hf }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          publisher_venv="$RUNNER_TEMP/lineforge-hf-publisher"
+          python3 -m venv --clear "$publisher_venv"
+          "$publisher_venv/bin/python" -m pip install --disable-pip-version-check \
+            -r "$GITHUB_WORKSPACE/requirements-hf-publish.txt"
+
+      - name: Publish validated dataset to Hugging Face
+        if: ${{ inputs.publish_to_hf }}
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+          HF_DATASET_LICENSE: ${{ vars.HF_DATASET_LICENSE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "The gated publisher requires the repository Actions secret HF_TOKEN."
+            exit 1
+          fi
+          if [[ -z "${HF_DATASET_REPO:-}" || -z "${HF_DATASET_LICENSE:-}" ]]; then
+            echo "Configure the repository Actions variables HF_DATASET_REPO and HF_DATASET_LICENSE after the rights and license review."
+            exit 1
+          fi
+          "$RUNNER_TEMP/lineforge-hf-publisher/bin/python" \
+            "$GITHUB_WORKSPACE/scripts/lineforge_hf_publish.py" \
+            --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
+            --source-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
+            --source-root "$LINEFORGE_SOURCE_ROOT" \
+            --repo-id "$HF_DATASET_REPO" \
+            --dataset-license "$HF_DATASET_LICENSE" \
+            --card-template "$GITHUB_WORKSPACE/docs/huggingface-dataset-card.template.md" \
+            --target 100024 \
+            --confirm-publish
