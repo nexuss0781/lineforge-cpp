@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,43 @@ def inside_roi(box: Box, roi: Box | None) -> bool:
     return roi[0] <= center_x < roi[2] and roi[1] <= center_y < roi[3]
 
 
+def vertical_boundary_summary(errors: list[tuple[float, float]]) -> dict[str, Any]:
+    top = [error[0] for error in errors]
+    bottom = [error[1] for error in errors]
+    count = len(errors)
+    if not count:
+        return {
+            "matched_lines": 0,
+            "mean_absolute_top_error_px": None,
+            "median_absolute_top_error_px": None,
+            "mean_absolute_bottom_error_px": None,
+            "median_absolute_bottom_error_px": None,
+            "top_within_3px": 0,
+            "bottom_within_3px": 0,
+            "top_clipped": 0,
+            "bottom_clipped": 0,
+            "top_excess_whitespace": 0,
+            "bottom_excess_whitespace": 0,
+        }
+    absolute_top = [abs(value) for value in top]
+    absolute_bottom = [abs(value) for value in bottom]
+    return {
+        "matched_lines": count,
+        "mean_absolute_top_error_px": round(sum(absolute_top) / count, 3),
+        "median_absolute_top_error_px": round(statistics.median(absolute_top), 3),
+        "mean_absolute_bottom_error_px": round(sum(absolute_bottom) / count, 3),
+        "median_absolute_bottom_error_px": round(statistics.median(absolute_bottom), 3),
+        "top_within_3px": sum(value <= 3 for value in absolute_top),
+        "bottom_within_3px": sum(value <= 3 for value in absolute_bottom),
+        # Positive top error means the crop begins inside the annotated line;
+        # negative bottom error means it ends before the annotated line ends.
+        "top_clipped": sum(value > 0 for value in top),
+        "bottom_clipped": sum(value < 0 for value in bottom),
+        "top_excess_whitespace": sum(value < 0 for value in top),
+        "bottom_excess_whitespace": sum(value > 0 for value in bottom),
+    }
+
+
 def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[str, Any]:
     manifest_path = Path(page["manifest"])
     if not manifest_path.is_absolute():
@@ -75,8 +113,17 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
         matched_pred.add(pi)
         matched_truth.add(gi)
         coverage = intersection(predicted[pi], truth[gi]) / area(truth[gi])
+        top_error = predicted[pi][1] - truth[gi][1]
+        bottom_error = predicted[pi][3] - truth[gi][3]
         matches.append({"prediction_index": pi, "truth_index": gi,
-                        "iou": round(score, 4), "truth_coverage": round(coverage, 4)})
+                        "iou": round(score, 4), "truth_coverage": round(coverage, 4),
+                        "top_boundary_error_px": round(top_error, 3),
+                        "bottom_boundary_error_px": round(bottom_error, 3)})
+
+    vertical_boundary = vertical_boundary_summary([
+        (match["top_boundary_error_px"], match["bottom_boundary_error_px"])
+        for match in matches
+    ])
 
     coverage_by_truth: list[list[tuple[int, float]]] = [[] for _ in truth]
     coverage_by_pred: list[list[tuple[int, float]]] = [[] for _ in predicted]
@@ -157,6 +204,7 @@ def evaluate_page(page: dict[str, Any], root: Path, threshold: float) -> dict[st
                                      if error_predictions else None),
         "page_has_segmentation_error": page_has_error,
         "page_has_review_alert": page_has_review_alert,
+        "vertical_boundary": vertical_boundary,
         "matches": matches,
     }
 
@@ -184,6 +232,10 @@ def main() -> int:
     total_reviews = sum(page["review_candidates"] for page in pages)
     total_crop_errors = sum(page["crop_error_candidates"] for page in pages)
     total_reviewed_crop_errors = sum(page["reviewed_crop_errors"] for page in pages)
+    all_vertical_errors = [
+        (match["top_boundary_error_px"], match["bottom_boundary_error_px"])
+        for page in pages for match in page["matches"]
+    ]
     error_pages = [page for page in pages if page["page_has_segmentation_error"]]
     reviewed_error_pages = sum(page["page_has_review_alert"] for page in error_pages)
     result = {
@@ -211,6 +263,7 @@ def main() -> int:
             "pages_with_segmentation_errors": len(error_pages),
             "error_page_review_recall": (round(reviewed_error_pages / len(error_pages), 4)
                                          if error_pages else None),
+            "vertical_boundary": vertical_boundary_summary(all_vertical_errors),
         },
     }
     output = json.dumps(result, ensure_ascii=False, indent=2)

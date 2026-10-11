@@ -42,6 +42,12 @@ struct Band {
     bool non_text_fragment = false;
     int region = 0;
     std::vector<std::string> review_reasons;
+    // Keep the detected ink envelope and its valley-limited crop window
+    // separate from the exported line boundary.
+    int ink_y0 = -1;
+    int ink_y1 = -1;
+    int crop_y0 = -1;
+    int crop_y1 = -1;
 };
 
 static void require(bool ok, const std::string& message) {
@@ -839,13 +845,180 @@ static void mark_uncertain_bands(std::vector<Band>& bands, int width, int height
     }
 }
 
+static int row_ink_in_xrange(const std::vector<uint8_t>& mask, int width,
+                             int y, int x0, int x1) {
+    int ink = 0;
+    const size_t row = static_cast<size_t>(y) * width;
+    for (int x = std::max(0, x0); x <= std::min(width - 1, x1); ++x)
+        ink += mask[row + static_cast<size_t>(x)] != 0;
+    return ink;
+}
+
+static int band_peak_row_ink(const std::vector<uint8_t>& mask, int width,
+                             const Band& band) {
+    int peak = 0;
+    for (int y = band.y0; y <= band.y1; ++y)
+        peak = std::max(peak, row_ink_in_xrange(mask, width, y, band.x0, band.x1));
+    return peak;
+}
+
+static int median_value(std::vector<int> values, int fallback) {
+    if (values.empty()) return fallback;
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
+}
+
+static void refine_vertical_boundaries(std::vector<Band>& bands,
+                                       const std::vector<uint8_t>& mask,
+                                       int width, int height, bool debug = false) {
+    size_t region_count = 1;
+    for (const auto& band : bands)
+        region_count = std::max(region_count,
+            static_cast<size_t>(std::max(0, band.region)) + 1);
+    std::vector<std::vector<size_t>> by_region(region_count);
+    for (size_t i = 0; i < bands.size(); ++i) {
+        auto& band = bands[i];
+        band.ink_y0 = band.y0;
+        band.ink_y1 = band.y1;
+        if (!band.non_text_fragment && !band.page_number)
+            by_region[static_cast<size_t>(std::max(0, band.region))].push_back(i);
+    }
+
+    for (auto& indices : by_region) {
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            if (bands[a].y0 != bands[b].y0) return bands[a].y0 < bands[b].y0;
+            return bands[a].x0 < bands[b].x0;
+        });
+        if (indices.empty()) continue;
+
+        std::vector<int> normal_heights;
+        for (size_t index : indices) {
+            const int h = bands[index].y1 - bands[index].y0 + 1;
+            if (h >= 3 && h <= height * 0.08) normal_heights.push_back(h);
+        }
+        const int typical_height = std::max(3, median_value(std::move(normal_heights), 12));
+
+        std::vector<int> pitches;
+        for (size_t i = 1; i < indices.size(); ++i) {
+            const auto& previous = bands[indices[i - 1]];
+            const auto& current = bands[indices[i]];
+            const double previous_center = (previous.y0 + previous.y1) / 2.0;
+            const double current_center = (current.y0 + current.y1) / 2.0;
+            const int pitch = static_cast<int>(std::lround(current_center - previous_center));
+            if (pitch >= std::max(3, static_cast<int>(std::lround(typical_height * 0.65))) &&
+                pitch <= typical_height * 3.5)
+                pitches.push_back(pitch);
+        }
+        const int typical_pitch = median_value(std::move(pitches),
+                                               static_cast<int>(std::lround(typical_height * 1.5)));
+
+        std::vector<int> shared_cut(indices.size() > 1 ? indices.size() - 1 : 0, -1);
+        for (size_t i = 0; i + 1 < indices.size(); ++i) {
+            const auto& upper = bands[indices[i]];
+            const auto& lower = bands[indices[i + 1]];
+            const int upper_h = upper.y1 - upper.y0 + 1;
+            const int lower_h = lower.y1 - lower.y0 + 1;
+            const int gap_start = upper.y1 + 1;
+            const int gap_end = lower.y0; // exclusive
+            const int gap = gap_end - gap_start;
+            const double center_distance = (lower.y0 + lower.y1 - upper.y0 - upper.y1) / 2.0;
+            const int pair_scale = std::min(std::max(upper_h, lower_h),
+                                            std::max(typical_height, static_cast<int>(typical_height * 1.6)));
+            const bool nearby_rows = center_distance <= std::max(pair_scale * 2.2,
+                                                                  typical_pitch * 1.5);
+            const int max_gap = std::max(1, static_cast<int>(std::lround(
+                std::min(std::max(upper_h, lower_h) * 0.65, center_distance * 0.48))));
+            if (!nearby_rows || gap < 0 || gap > max_gap) continue;
+
+            const int x0 = std::min(upper.x0, lower.x0);
+            const int x1 = std::max(upper.x1, lower.x1);
+            int upper_peak = band_peak_row_ink(mask, width, upper);
+            int lower_peak = band_peak_row_ink(mask, width, lower);
+            const int max_valley_ink = std::max(1, std::min(upper_peak, lower_peak) / 12);
+            int min_ink = std::numeric_limits<int>::max();
+            double best_distance = std::numeric_limits<double>::infinity();
+            int valley_row = gap_start;
+            const double gap_midpoint = (gap_start + gap_end) / 2.0;
+            for (int y = gap_start; y < gap_end; ++y) {
+                const int ink = row_ink_in_xrange(mask, width, y, x0, x1);
+                const double distance = std::abs((y + 0.5) - gap_midpoint);
+                if (ink < min_ink || (ink == min_ink && distance < best_distance)) {
+                    min_ink = ink;
+                    best_distance = distance;
+                    valley_row = y;
+                }
+            }
+            if (min_ink > max_valley_ink) continue;
+
+            const int cut = std::clamp(static_cast<int>(std::lround(valley_row + 0.5)),
+                                       gap_start, gap_end);
+            shared_cut[i] = cut;
+            if (debug)
+                std::cerr << "debug: vertical_whitespace_cut region=" << upper.region
+                          << " y=" << gap_start << ".." << gap_end
+                          << " min_row_ink=" << min_ink << " cut=" << cut << "\n";
+        }
+
+        for (size_t i = 0; i < indices.size(); ++i) {
+            auto& band = bands[indices[i]];
+            const int original_y0 = band.y0;
+            const int original_y1_exclusive = band.y1 + 1;
+            const int ink_height = original_y1_exclusive - original_y0;
+            const int target_pad = std::max(1, static_cast<int>(std::lround(ink_height * 0.18)));
+
+            int refined_y0 = original_y0;
+            int refined_y1_exclusive = original_y1_exclusive;
+            int crop_y0 = std::max(0, original_y0 - target_pad);
+            int crop_y1_exclusive = std::min(height, original_y1_exclusive + target_pad);
+            if (i > 0 && shared_cut[i - 1] >= 0) {
+                refined_y0 = shared_cut[i - 1];
+                crop_y0 = shared_cut[i - 1];
+            } else {
+                int pad = target_pad;
+                if (i > 0) {
+                    const auto& previous = bands[indices[i - 1]];
+                    const int available = original_y0 - previous.y1 - 1;
+                    pad = std::min(pad, std::max(0, available / 2));
+                }
+                refined_y0 = std::max(0, original_y0 - pad);
+                crop_y0 = refined_y0;
+            }
+            if (i + 1 < indices.size() && shared_cut[i] >= 0) {
+                refined_y1_exclusive = shared_cut[i];
+                crop_y1_exclusive = shared_cut[i];
+            } else {
+                int pad = target_pad;
+                if (i + 1 < indices.size()) {
+                    const auto& next = bands[indices[i + 1]];
+                    const int available = next.y0 - band.y1 - 1;
+                    pad = std::min(pad, std::max(0, available / 2));
+                }
+                refined_y1_exclusive = std::min(height, original_y1_exclusive + pad);
+                crop_y1_exclusive = refined_y1_exclusive;
+            }
+            band.y0 = std::clamp(refined_y0, 0, height - 1);
+            band.y1 = std::clamp(refined_y1_exclusive - 1, band.y0, height - 1);
+            band.crop_y0 = std::clamp(crop_y0, 0, height - 1);
+            band.crop_y1 = std::clamp(crop_y1_exclusive - 1, band.crop_y0, height - 1);
+            if (debug && (band.y0 != original_y0 || band.y1 + 1 != original_y1_exclusive))
+                std::cerr << "debug: vertical_boundary_refine region=" << band.region
+                          << " original=[" << original_y0 << "," << original_y1_exclusive
+                          << ") refined=[" << band.y0 << "," << band.y1 + 1 << ")\n";
+        }
+    }
+}
+
 static Image crop_with_white_padding(const Image& gray, const Band& b) {
-    const int line_h = b.y1 - b.y0 + 1;
+    const int ink_y0 = b.ink_y0 >= 0 ? b.ink_y0 : b.y0;
+    const int ink_y1 = b.ink_y1 >= ink_y0 ? b.ink_y1 : b.y1;
+    const int line_h = ink_y1 - ink_y0 + 1;
     // Detached Ethiopic marks often sit above or below the main glyph bodies.
     const int pad_y = std::max(3, static_cast<int>(std::lround(line_h * 0.55)));
     const int pad_x = std::max(4, static_cast<int>(std::lround(line_h * 0.18)));
     const int x0 = std::max(0, b.x0 - pad_x), x1 = std::min(gray.width - 1, b.x1 + pad_x);
-    const int y0 = std::max(0, b.y0 - pad_y), y1 = std::min(gray.height - 1, b.y1 + pad_y);
+    const int y0 = b.crop_y0 >= 0 ? b.crop_y0 : std::max(0, b.y0 - pad_y);
+    const int y1 = b.crop_y1 >= y0 ? b.crop_y1 : std::min(gray.height - 1, b.y1 + pad_y);
     const int ow = x1 - x0 + 1, oh = y1 - y0 + 1;
     const int border = std::max(2, static_cast<int>(std::lround(line_h * 0.10)));
     Image out{ow + 2 * border, oh + 2 * border, std::vector<uint8_t>(static_cast<size_t>(ow + 2 * border) * (oh + 2 * border), 255)};
@@ -1047,6 +1220,9 @@ int main(int argc, char** argv) {
                 ++lines_per_region[static_cast<size_t>(b.region - 1)];
         mark_likely_page_numbers(bands, processed.width, processed.height, opt.filter_page_number);
         mark_uncertain_bands(bands, processed.width, processed.height);
+        // Classification and exclusions are final before this purely geometric
+        // pass, so the line-candidate decisions remain unchanged.
+        refine_vertical_boundaries(bands, mask, processed.width, processed.height, opt.debug);
         const auto segmented = std::chrono::steady_clock::now();
         if (opt.debug) {
             std::cerr << "debug: deskew_degrees=" << angle << " layout=" << layout_name

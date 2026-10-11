@@ -1,20 +1,39 @@
 # Benchmark and validation record
 
 **Run date:** 2026-10-11
-**Engine:** `linecrop 0.4.0`
+**Engine:** `linecrop 0.4.1`
 **Build:** Release, GCC 13.3.0, CMake, Ubuntu 24.04
 
 ## Results
 
 | Evaluation | Result | Scope and qualification |
 | --- | --- | --- |
-| Synthetic geometry suite | **42/42 passed** | Deterministic fixtures, including close-pitch vertical valleys and top-edge clipping. Not real-world accuracy or OCR quality. |
-| CTest | **2/2 passed** | The 42-case geometry suite and **8 evaluator unit tests**. |
+| Synthetic geometry suite | **43/43 passed** | Adds a four-font-size vertical-boundary tolerance case and verifies one text-row group per crop. Not real-world accuracy or OCR quality. |
+| CTest | **2/2 passed** | The 43-case geometry suite and **10 evaluator unit tests**. |
 | AddressSanitizer/UndefinedBehaviorSanitizer | **2/2 passed** | Both CTest targets passed with leak detection and halt-on-error enabled. |
-| Four independently labeled real-page ROIs | **32/34 predictions matched 36 labeled lines** at IoU ≥ 0.50; precision **0.941**, recall **0.889** | Two merged crops, four unmatched labeled lines, two false-positive crops, and zero cut-line indicators across four selected ROIs from two scanned documents. This is a small ROI sample, not whole-page or corpus-wide accuracy. |
-| Held-out ROI review workload and error recall | **2/34 candidates flagged (5.9%)**; crop-error review recall **2/2 (1.00)**; error-page alert recall **2/2 (1.00)** | Both measurable crop errors were flagged, and both ROIs with segmentation errors had a review alert. The denominator is only two crop errors and two error-containing ROIs; this is not a calibrated guarantee for other pages or error types. |
+| Focused vertical-boundary audit, four unique real-page ROIs | **23/23 lines matched** at IoU ≥ 0.50 | On the same labels, mean absolute top error improved **4.478 → 1.304 px**, bottom **4.217 → 1.000 px**; boundaries within 3 px improved **4/23 → 21/23 top** and **3/23 → 23/23 bottom**. Two top boundaries remain over 3 px. |
+| Exact brown page, high-resolution repeat | **9/9 top and 8/9 bottom boundaries within 3 px** | The same nine page-26 labels were scaled to the 1488×2103 PDF scan/page-25 raster; this is a scale-repeat check, not nine additional independent lines. Mean absolute error: top **1.556 px**, bottom **1.667 px**; one bottom edge is 4 px out. |
+| Earlier 0.4.0 held-out real-page evaluation | **32/34 predictions matched 36 labeled lines** at IoU ≥ 0.50; precision **0.941**, recall **0.889** | Two merged crops, four unmatched labeled lines, two false-positive crops, and zero cut-line indicators across four selected ROIs from two scanned documents. This earlier sample is not whole-page or corpus-wide accuracy. |
+| Earlier 0.4.0 review workload and error recall | **2/34 candidates flagged (5.9%)**; crop-error review recall **2/2 (1.00)**; error-page alert recall **2/2 (1.00)** | Historical result with only two crop errors and two error-containing ROIs; it is not a calibrated guarantee for other pages or error types. |
 | Full private-PDF corpus, baseline | **361 pages**, 12,452 kept crop candidates, 1,573 kept crops flagged, 508 excluded candidates | Two documents: 83 and 278 pages. Candidate and flag counts are workload measures, not ground-truth accuracy. |
 | Full private-PDF corpus, 0.4.0 | **361 pages**, 12,816 kept crop candidates, 806 kept crops flagged, 514 excluded candidates | Same locally rasterized pages and 1,200-pixel rendering setting as baseline. The new detector emitted 364 more candidates (+2.9%). |
+
+## 0.4.1 vertical-boundary audit
+
+The focused audit used the same 23 independently labeled line boxes across four selected ROIs on four real pages from two scanned documents. It compared the local 0.4.0 baseline with 0.4.1 using the evaluator's one-to-one IoU matches, then scored each matched top and bottom edge separately. The labels cover scan-A pages 25, 26, and 43, plus scan-B page 2; they are a small selected sample, not a claim about all pages or font sizes.
+
+| Boundary measure | 0.4.0 baseline | 0.4.1 |
+| --- | ---: | ---: |
+| Mean absolute top error | 4.478 px | **1.304 px** |
+| Median absolute top error | 4 px | **1 px** |
+| Mean absolute bottom error | 4.217 px | **1.000 px** |
+| Median absolute bottom error | 4 px | **1 px** |
+| Top boundaries within 3 px | 4/23 | **21/23** |
+| Bottom boundaries within 3 px | 3/23 | **23/23** |
+
+All 23 labels matched one emitted crop in both versions. The two remaining top-boundary misses over 3 px are on page 43; no bottom boundary in this sample exceeds 3 px. Some revised edges trade slight extra blank margin for reduced clipping: six top edges and twelve bottom edges extend past the label, but these remain within the measured error distribution. On the exact brown source rendered at 1488×2103, the same nine page-26 labels were scaled from its 992×1402 version: 9/9 tops and 8/9 bottoms are within 3 px, with a largest bottom error of 4 px. This repeat is not counted as additional unique labels.
+
+The refined geometry changed only vertical boundaries and crop windows in the five compared runs. Kept-line counts, horizontal coordinates, review flags/reasons, and excluded-candidate boxes were identical to 0.4.0. Four sampled output crops from the brown page and page 43 were visually inspected: the updated crops no longer show fragments of the next row at their vertical edges, and no visible ascender/descender/mark clipping was found in those examples. This is a limited visual spot check, not a full-page guarantee. Private PDFs, images, crop outputs, overlays, and labels remain outside the repository.
 
 ### Review-workload comparison
 
@@ -46,7 +65,7 @@ The two error-containing ROIs each had a review alert. The four unmatched labels
 
 ## Synthetic coverage and reproducibility
 
-The 42 deterministic checks cover 24 generated pages across clean, low-contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font or pseudo-Ethiopic text (three seeds each); two blank-page rejection cases; a 15.55-megapixel throughput case; sparse row noise; close-pitch vertical rows; clipped top-edge text beside a dark scan-border stroke; heading/underline/detached-mark/speck/footer handling; four CLI/error-path cases; and seven layout cases. These tests check geometry, ordering, crop files, repair behavior, skew, reading order, and review metadata. They do not measure transcription or OCR accuracy.
+The 43 deterministic checks cover 24 generated pages across clean, low-contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font or pseudo-Ethiopic text (three seeds each); two blank-page rejection cases; a 15.55-megapixel throughput case; sparse row noise; close-pitch vertical rows; a four-font-size vertical-boundary/crop-isolation case; clipped top-edge text beside a dark scan-border stroke; heading/underline/detached-mark/speck/footer handling; four CLI/error-path cases; and seven layout cases. These tests check geometry, ordering, crop files, repair behavior, skew, reading order, and review metadata. They do not measure transcription or OCR accuracy.
 
 Re-run with:
 
@@ -62,10 +81,11 @@ The private source PDFs, raster pages, crop outputs, overlays, and annotation JS
 
 - Kept horizontal recursive whitespace/XY-cut layout intelligence, with columns and blocks identified before line rows.
 - Refined vertical line bands using region-local row profiles, low-density valleys, connected components, and observed local line spacing.
+- Split adjacent line boxes and crop windows at measured low-ink valleys, with font-scale-relative margins only at unpaired boundaries.
 - Constrained each line's horizontal bounds to ink within its own vertical membership; retained detached Ethiopic marks while suppressing long page-edge strokes.
 - Made scale-based uncertainty checks local to each block and tightened fragment and edge flags using structural evidence.
 - Extended evaluation to report review workload, crop-error review recall, and error-page alert recall, including missed lines.
 
 ## Limitations
 
-Full-corpus candidate/flag counts are not an accuracy denominator. The held-out hand-labeled evaluation covers only 36 lines in four selected ROIs. Its observed 100% error recall is based on just two crop-error candidates and two affected ROIs, and must not be generalized. Decorative covers and irregular layouts remain high-noise; review flags and excluded candidates should still be inspected on such pages. PDFs and all derived images, crops, overlays, and labels remain private and were not committed.
+Full-corpus candidate/flag counts are not an accuracy denominator. The earlier held-out hand-labeled evaluation covers only 36 lines in four selected ROIs; its observed 100% error recall is based on just two crop-error candidates and two affected ROIs, and must not be generalized. The new vertical-boundary audit covers only 23 unique lines; two top edges remain more than 3 px from their labels, so performance across all fonts, pages, and irregular layouts is not established. Decorative covers and irregular layouts remain high-noise; review flags and excluded candidates should still be inspected on such pages. PDFs and all derived images, crops, overlays, and labels remain private and were not committed.
