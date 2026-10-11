@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(lineforge VERSION 0.1.0 LANGUAGES CXX)
+project(lineforge VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,4 +20,7 @@ if(BUILD_TESTING)
             --binary $<TARGET_FILE:linecrop>
             --work-dir ${CMAKE_CURRENT_BINARY_DIR}/benchmark)
   set_tests_properties(synthetic_benchmark PROPERTIES TIMEOUT 180)
+  add_test(NAME real_page_eval_unit
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_real_page_eval.py)
 endif()

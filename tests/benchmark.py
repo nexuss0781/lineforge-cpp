@@ -102,6 +102,48 @@ def make_page(path, mode, seed, skew=0.0, size=(1000, 1200)):
     return None
 
 
+def make_row_noise_fixture(path):
+    """Draw eight pseudo-Ethiopic rows with sparse scan dust in the gutters."""
+    im = Image.new("L", (1000, 1000), 255)
+    draw = ImageDraw.Draw(im)
+    rng = random.Random(117)
+    tops = [130 + i * 75 for i in range(8)]
+    for y in tops:
+        pseudo_ethiopic(draw, 100, y, 900, y + 26, rng, ink=12)
+    # Repeated short scan marks keep a low global row median but can bridge
+    # neighboring line bands under a fixed, very low projection threshold.
+    for i in range(len(tops) - 1):
+        for y in range(tops[i] + 30, tops[i + 1], 3):
+            x = rng.randrange(100, 890)
+            draw.line((x, y, min(899, x + 3), y), fill=35, width=1)
+    im.save(path, "PNG")
+
+
+def run_row_noise_case(binary, work):
+    source, out = work / "row_noise_bridge.png", work / "out_row_noise_bridge"
+    make_row_noise_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0 or not (out / "manifest.json").exists():
+        return {"case": "row_noise_bridge", "pass": False, "error": proc.stderr.strip(),
+                "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    width, height = manifest["image_size"]["width"], manifest["image_size"]["height"]
+    checks = {
+        "eight_rows_separated": len(lines) == 8,
+        "reasonable_line_heights": all(0.015 <= (b["bbox_xyxy"][3] - b["bbox_xyxy"][1]) / height <= 0.05 for b in lines),
+        "text_widths_preserved": all((b["bbox_xyxy"][2] - b["bbox_xyxy"][0]) >= 0.55 * width for b in lines),
+        "reading_order": [b["bbox_xyxy"][1] for b in lines] == sorted(b["bbox_xyxy"][1] for b in lines),
+        "no_false_footer": manifest["excluded"] == [],
+        "nonempty_crops": all((out / b["file"]).exists() and (out / b["file"]).stat().st_size > 100 for b in lines),
+    }
+    return {"case": "row_noise_bridge", "pass": all(checks.values()), "checks": checks,
+            "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
+
+
 def run_case(binary, work, mode, index, size=(1000, 1200)):
     source = work / f"{mode}_{index:02d}.png"
     out = work / f"out_{mode}_{index:02d}"
@@ -153,6 +195,77 @@ def run_blank_case(binary, work, dark=False):
     return {"case": name, "pass": ok, "elapsed_ms": round(elapsed_ms, 2), "checks": {"empty_page_rejected": ok}}
 
 
+def make_heading_underline_fixture(path):
+    im = Image.new("L", (1000, 1200), 255)
+    draw = ImageDraw.Draw(im)
+    try:
+        heading = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34)
+    except OSError:
+        heading = ImageFont.load_default()
+    draw.text((330, 88), "SECTION TWO", font=heading, fill=12)
+    draw.line((330, 132, 665, 132), fill=12, width=3)
+    rng = random.Random(4401)
+    tops = (240, 420, 600, 780)
+    for y in tops:
+        pseudo_ethiopic(draw, 110, y, 890, y + 34, rng, ink=12)
+    # A detached paired mark just above the first line should stay inside its
+    # grayscale crop; a distant singleton should not become a crop of its own.
+    draw.rectangle((112, 233, 113, 234), fill=12)
+    draw.point((950, 405), fill=12)
+    try:
+        footer = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 25)
+    except OSError:
+        footer = ImageFont.load_default()
+    draw.text((493, 1010), "3", font=footer, fill=12)
+    im.save(path, "PNG")
+
+
+def run_heading_underline_case(binary, work):
+    source, out = work / "heading_underline.png", work / "out_heading_underline"
+    make_heading_underline_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0:
+        return {"case": "heading_underline_marks", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines, excluded = manifest["lines"], manifest["excluded"]
+    heading_lines = [b for b in lines if b["bbox_xyxy"][1] < 180]
+    first_body = next((b for b in lines if 220 <= b["bbox_xyxy"][1] <= 280), None)
+    mark_retained = False
+    if first_body:
+        x0, y0, x1, y1 = first_body["bbox_xyxy"]
+        box_h = y1 - y0 + 1
+        pad_x = max(4, round(box_h * 0.18))
+        pad_y = max(3, round(box_h * 0.55))
+        border = max(2, round(box_h * 0.10))
+        crop_x, crop_y = x0 - pad_x - border, y0 - pad_y - border
+        crop = Image.open(out / first_body["file"]).convert("L")
+        dot_region = crop.crop((112 - crop_x, 233 - crop_y, 114 - crop_x, 235 - crop_y))
+        mark_retained = dot_region.getextrema()[0] < 100
+    separate_underline_crop = any(
+        b["bbox_xyxy"][1] >= 125 and b["bbox_xyxy"][3] <= 140 and
+        b["bbox_xyxy"][2] - b["bbox_xyxy"][0] > 200 for b in lines
+    )
+    false_singleton = any(
+        b["bbox_xyxy"][0] <= 950 < b["bbox_xyxy"][2] and
+        b["bbox_xyxy"][1] <= 405 < b["bbox_xyxy"][3] for b in lines
+    )
+    checks = {
+        "heading_kept_once": len(heading_lines) == 1,
+        "underline_not_emitted_as_own_crop": not separate_underline_crop,
+        "four_body_lines_kept": len(lines) - len(heading_lines) == 4,
+        "detached_mark_retained_in_crop": mark_retained,
+        "singleton_speck_not_a_crop": not false_singleton,
+        "one_footer_number_excluded": sum(e["reason"] == "likely_centered_page_number" for e in excluded) == 1,
+    }
+    return {"case": "heading_underline_marks", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2),
+            "line_count": len(lines), "excluded_count": len(excluded)}
+
+
 def run_cli_cases(binary, work):
     results = []
     source = work / "clean_00.png"
@@ -184,7 +297,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.2.0" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 0.3.0" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -230,6 +343,16 @@ def make_layout_fixture(path, kind):
         for i, y in enumerate((150, 280, 410, 540)):
             draw_fixture_line(draw, font, 70, 520, y, i)
             draw_fixture_line(draw, font, 680, 1130, y, i + 1)
+        # The dark scan binding must not connect both pages into one text line.
+        draw.line((600, 15, 600, 1085), fill=0, width=12)
+        # Short frame marks and detached specks must not become OCR line crops.
+        draw.line((2, 720, 2, 780), fill=0, width=4)
+        draw.rectangle((120, 800, 126, 806), fill=0)
+        # Sparse dots from a scan-bed rule are not a long text line.
+        for x in range(800, 1100, 30):
+            draw.rectangle((x, 700, x + 2, 701), fill=0)
+        # A full-width scan-bed bar must not be treated as another text line.
+        draw.line((0, 1092, 1199, 1092), fill=0, width=6)
         # Facing-page footers sit in the center of each leaf, not the spread.
         draw.text((295, 930), "7", font=font, fill=12)
         draw.text((895, 930), "8", font=font, fill=12)
@@ -291,7 +414,10 @@ def run_layout_case(binary, work, kind, reading_order="ltr"):
         "layout_regions_reported": bool(manifest["layout"]["regions"]),
         "requested_reading_order_reported": manifest["layout"]["reading_order"] == reading_order,
         "column_major_reading_order": ordered,
-        "footer_candidates": len(manifest["excluded"]) == expected_excluded,
+        "footer_candidates": sum(e["reason"] == "likely_centered_page_number" for e in manifest["excluded"]) == expected_excluded,
+        "edge_artifacts_reported": kind != "spread" or sum(e["reason"] == "likely_non_text_fragment" for e in manifest["excluded"]) >= 3,
+        "bottom_scan_bar_not_emitted": kind != "spread" or all(
+            b["bbox_xyxy"][1] < manifest["image_size"]["height"] * 0.985 for b in lines),
         "nonempty_crops": all((out / b["file"]).exists() and (out / b["file"]).stat().st_size > 100 for b in lines),
     }
     return {"case": f"layout_{kind}_{reading_order}", "pass": all(checks.values()),
@@ -366,6 +492,8 @@ def main():
         results = [run_case(args.binary.resolve(), work, mode, i) for mode in modes for i in range(3)]
         results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
         results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
+        results.append(run_row_noise_case(args.binary.resolve(), work))
+        results.append(run_heading_underline_case(args.binary.resolve(), work))
         results.extend(run_cli_cases(args.binary.resolve(), work))
         results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
                        run_layout_case(args.binary.resolve(), work, "columns"),
@@ -380,6 +508,8 @@ def main():
             results = [run_case(args.binary.resolve(), work, mode, i) for mode in modes for i in range(3)]
             results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
             results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
+            results.append(run_row_noise_case(args.binary.resolve(), work))
+            results.append(run_heading_underline_case(args.binary.resolve(), work))
             results.extend(run_cli_cases(args.binary.resolve(), work))
             results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
                            run_layout_case(args.binary.resolve(), work, "columns"),
