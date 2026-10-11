@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(lineforge VERSION 0.3.0 LANGUAGES CXX)
+project(lineforge VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,7 @@ find_package(PNG REQUIRED)
 
 add_executable(linecrop src/main.cpp)
 target_link_libraries(linecrop PRIVATE JPEG::JPEG PNG::PNG)
+target_compile_definitions(linecrop PRIVATE LINEFORGE_VERSION=\"${PROJECT_VERSION}\")
 target_compile_options(linecrop PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 include(CTest)

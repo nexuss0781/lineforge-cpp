@@ -144,6 +144,79 @@ def run_row_noise_case(binary, work):
             "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
 
 
+def make_dense_vertical_fixture(path):
+    """Create close-pitch rows whose projection valleys are narrow and shallow."""
+    im = Image.new("L", (1000, 900), 255)
+    draw = ImageDraw.Draw(im)
+    rng = random.Random(314)
+    for i in range(12):
+        top = 100 + i * 38
+        pseudo_ethiopic(draw, 90, top, 910, top + 35, rng, ink=12, scale=0.9)
+    im.save(path, "PNG")
+
+
+def run_dense_vertical_case(binary, work):
+    source, out = work / "dense_vertical_profile.png", work / "out_dense_vertical_profile"
+    make_dense_vertical_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0 or not (out / "manifest.json").exists():
+        return {"case": "dense_vertical_profile", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    width, height = manifest["image_size"]["width"], manifest["image_size"]["height"]
+    boxes = [b["bbox_xyxy"] for b in lines]
+    checks = {
+        "twelve_close_pitch_rows_recovered": len(lines) == 12,
+        "line_heights_remain_local": all(0.015 <= (b[3] - b[1]) / height <= 0.06 for b in boxes),
+        "row_order_is_monotonic": [b[1] for b in boxes] == sorted(b[1] for b in boxes),
+        "horizontal_membership_is_preserved": all((b[2] - b[0]) >= 0.70 * width for b in boxes),
+        "crops_are_nonempty": all((out / b["file"]).exists() and (out / b["file"]).stat().st_size > 100
+                                   for b in lines),
+    }
+    return {"case": "dense_vertical_profile", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
+
+
+def make_edge_clipping_fixture(path):
+    im = Image.new("L", (1000, 900), 255)
+    draw = ImageDraw.Draw(im)
+    rng = random.Random(81)
+    pseudo_ethiopic(draw, 100, -15, 900, 25, rng, ink=12, scale=0.9)
+    pseudo_ethiopic(draw, 100, 200, 900, 235, rng, ink=12, scale=0.9)
+    # A genuine dark scan-border stroke should be removed without extending
+    # the text crop to the page edge or clearing its clipping alert.
+    draw.line((999, 0, 999, 300), fill=0, width=2)
+    im.save(path, "PNG")
+
+
+def run_edge_clipping_case(binary, work):
+    source, out = work / "edge_clipping.png", work / "out_edge_clipping"
+    make_edge_clipping_fixture(source)
+    started = time.perf_counter()
+    proc = subprocess.run([str(binary), "--input", str(source), "--output", str(out)],
+                          text=True, capture_output=True, check=False)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if proc.returncode != 0 or not (out / "manifest.json").exists():
+        return {"case": "edge_clipping", "pass": False,
+                "error": proc.stderr.strip(), "elapsed_ms": round(elapsed_ms, 2)}
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    lines = manifest["lines"]
+    top = next((b for b in lines if b["bbox_xyxy"][1] < 40), None)
+    lower = next((b for b in lines if b["bbox_xyxy"][1] > 100), None)
+    checks = {
+        "both_lines_preserved": len(lines) == 2 and top is not None and lower is not None,
+        "cropped_top_line_flagged": top is not None and "possible_page_edge_clipping" in top["review_reasons"],
+        "uncropped_line_not_edge_flagged": lower is not None and "possible_page_edge_clipping" not in lower["review_reasons"],
+        "border_stroke_excluded_from_horizontal_bounds": top is not None and top["bbox_xyxy"][2] < manifest["image_size"]["width"] - 20,
+    }
+    return {"case": "edge_clipping", "pass": all(checks.values()),
+            "checks": checks, "elapsed_ms": round(elapsed_ms, 2), "line_count": len(lines)}
+
+
 def run_case(binary, work, mode, index, size=(1000, 1200)):
     source = work / f"{mode}_{index:02d}.png"
     out = work / f"out_{mode}_{index:02d}"
@@ -297,7 +370,7 @@ def run_cli_cases(binary, work):
     started = time.perf_counter()
     proc = subprocess.run([str(binary), "--version"], text=True, capture_output=True, check=False)
     elapsed = (time.perf_counter() - started) * 1000
-    ok = proc.returncode == 0 and "linecrop 0.3.0" in proc.stdout
+    ok = proc.returncode == 0 and "linecrop 0.4.0" in proc.stdout
     results.append({"case": "cli_version", "pass": ok, "elapsed_ms": round(elapsed, 2),
                      "checks": {"version_reported": ok}})
 
@@ -493,6 +566,8 @@ def main():
         results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
         results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
         results.append(run_row_noise_case(args.binary.resolve(), work))
+        results.append(run_dense_vertical_case(args.binary.resolve(), work))
+        results.append(run_edge_clipping_case(args.binary.resolve(), work))
         results.append(run_heading_underline_case(args.binary.resolve(), work))
         results.extend(run_cli_cases(args.binary.resolve(), work))
         results.extend((run_layout_case(args.binary.resolve(), work, "spread"),
@@ -509,6 +584,8 @@ def main():
             results.extend(run_blank_case(args.binary.resolve(), work, dark=dark) for dark in (False, True))
             results.append(run_case(args.binary.resolve(), work, "large", 0, size=(3600, 4320)))
             results.append(run_row_noise_case(args.binary.resolve(), work))
+            results.append(run_dense_vertical_case(args.binary.resolve(), work))
+            results.append(run_edge_clipping_case(args.binary.resolve(), work))
             results.append(run_heading_underline_case(args.binary.resolve(), work))
             results.extend(run_cli_cases(args.binary.resolve(), work))
             results.extend((run_layout_case(args.binary.resolve(), work, "spread"),

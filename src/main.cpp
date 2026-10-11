@@ -21,6 +21,10 @@
 
 #include "layout.hpp"
 
+#ifndef LINEFORGE_VERSION
+#define LINEFORGE_VERSION "0.0.0"
+#endif
+
 namespace fs = std::filesystem;
 static constexpr uint64_t MAX_PIXELS = 100000000ULL;
 
@@ -321,8 +325,10 @@ static void suppress_page_rules(std::vector<uint8_t>& mask, int width, int heigh
         const bool near_outer_area = x < width * 0.25 || x > width * 0.75;
         const bool near_binding = std::abs(x - width * 0.5) <= width * 0.20;
         const bool continuous_outer_rule = near_outer_area && longest >= height * 0.40 && count >= height * 0.45;
+        const bool edge_attached_stroke = (x < width * 0.015 || x >= width * 0.985) &&
+            longest >= height * 0.20 && count >= height * 0.18;
         const bool interrupted_binding = near_binding && longest >= height * 0.08 && count >= height * 0.18;
-        if (continuous_outer_rule || interrupted_binding)
+        if (continuous_outer_rule || edge_attached_stroke || interrupted_binding)
             candidates[x] = 1;
     }
 
@@ -588,13 +594,39 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
         else merged.push_back(run);
     }
     std::vector<std::pair<int, int>> refined;
-    const int low_ink_limit = std::max(2, median_active_row_ink / 8);
-    const int min_valley = std::max(1, typical / 12);
+    // In a dense block, true inter-line valleys can retain faint Ethiopic
+    // marks and scan texture. Use a small fraction of local row activity rather
+    // than requiring an almost-empty row; the oversized-run and minimum-piece
+    // guards below keep ordinary glyph bowls from becoming split points.
+    const int low_ink_limit = std::max({2, median_active_row_ink / 8, row_threshold / 2});
+    // In tight line spacing the valley can be only one raster row wide; the
+    // local-depth threshold plus minimum piece height provide the safeguards.
+    const int min_valley = 1;
     const int min_fragment_height = std::max(5, static_cast<int>(std::lround(typical * 0.58)));
     const int oversized_limit = std::max(static_cast<int>(std::lround(typical * 2.0)),
                                          static_cast<int>(std::lround(line_pitch * 1.85)));
     for (const auto& run : merged) {
         const int run_height = run.second - run.first + 1;
+        if (debug && run_height > oversized_limit) {
+            std::vector<uint32_t> profile(rows.begin() + run.first, rows.begin() + run.second + 1);
+            std::sort(profile.begin(), profile.end());
+            std::cerr << "debug: oversized_row_profile y=[" << run.first << "," << run.second + 1
+                      << ") height=" << run_height << " typical=" << typical << " pitch=" << line_pitch
+                      << " low_limit=" << low_ink_limit << " q10=" << profile[profile.size() / 10]
+                      << " median=" << profile[profile.size() / 2] << " min=" << profile.front() << " minima=";
+            const int neighborhood = std::max(2, typical / 3);
+            int printed = 0;
+            for (int y = run.first + neighborhood; y <= run.second - neighborhood && printed < 20; ++y) {
+                const uint32_t value = rows[static_cast<size_t>(y)];
+                bool minimum = true;
+                for (int d = 1; d <= neighborhood; ++d)
+                    if (rows[static_cast<size_t>(y - d)] < value || rows[static_cast<size_t>(y + d)] < value) {
+                        minimum = false; break;
+                    }
+                if (minimum) { std::cerr << y << ":" << value << " "; ++printed; }
+            }
+            std::cerr << "\n";
+        }
         if (h < 80 || run_height <= oversized_limit) { refined.push_back(run); continue; }
         int segment_start = run.first;
         std::vector<std::pair<int, int>> pieces;
@@ -609,7 +641,7 @@ static std::vector<Band> find_bands(const std::vector<uint8_t>& mask, int w, int
                 segment_start = gap_end + 1;
             }
         }
-        if (pieces.empty() || (pieces.size() == 1 && pitches.empty())) refined.push_back(run);
+        if (pieces.empty()) refined.push_back(run);
         else {
             pieces.emplace_back(segment_start, run.second);
             for (const auto& piece : pieces) {
@@ -691,13 +723,27 @@ static void mark_likely_nontext_fragments(std::vector<Band>& bands, int w, int h
         const bool touches_side = b.x0 <= w * 0.01 || b.x1 >= w * 0.99;
         const bool side_scan_fragment = touches_side && bw <= w * 0.12 && bh >= std::max(8, static_cast<int>(h * 0.02));
         const bool long_narrow_binding = bw <= w * 0.05 && bh >= h * 0.15 && bh >= bw * 4;
+        bool attached_short_mark = false;
+        if (bh <= std::max(6, static_cast<int>(h * 0.01))) {
+            for (const auto& other : bands) {
+                if (&other == &b || other.region != b.region || other.non_text_fragment || other.page_number) continue;
+                const int other_h = other.y1 - other.y0 + 1;
+                const int gap = other.y0 > b.y1 ? other.y0 - b.y1 - 1 :
+                                b.y0 > other.y1 ? b.y0 - other.y1 - 1 : -1;
+                if (gap < 0 || gap > std::max(2, static_cast<int>(std::lround(bh * 0.35))) || other_h < bh * 1.5) continue;
+                const int overlap = std::max(0, std::min(b.x1, other.x1) - std::max(b.x0, other.x0) + 1);
+                const double ratio = static_cast<double>(overlap) / std::max(1, std::min(bw, other.x1 - other.x0 + 1));
+                if (ratio >= 0.60) { attached_short_mark = true; break; }
+            }
+        }
         const bool thin_horizontal_rule = bh <= std::max(4, static_cast<int>(h * 0.005)) &&
                                           bw >= w * 0.12 &&
                                           (b.ink * 4 <= static_cast<uint64_t>(bw) ||
                                            (b.components <= 2 && static_cast<double>(b.ink) >=
                                             static_cast<double>(bw) * bh * 0.55));
         const bool isolated_speck = bw <= w * 0.02 && bh <= h * 0.015 && b.components <= 3;
-        b.non_text_fragment = side_scan_fragment || long_narrow_binding || thin_horizontal_rule || isolated_speck;
+        b.non_text_fragment = side_scan_fragment || long_narrow_binding ||
+                              (thin_horizontal_rule && !attached_short_mark) || isolated_speck;
     }
 }
 
@@ -729,10 +775,13 @@ static void merge_short_line_fragments(std::vector<Band>& bands, int height) {
         const int gap = b.y0 - a.y1 - 1;
         const int overlap = std::max(0, std::min(a.x1, b.x1) - std::max(a.x0, b.x0) + 1);
         const double overlap_ratio = static_cast<double>(overlap) / std::max(1, std::min(aw, bw));
+        const bool small_pair = ah <= fragment_height && bh <= fragment_height && gap <= fragment_gap;
+        const bool detached_mark_pair = (ah <= fragment_height || bh <= fragment_height) &&
+            gap <= std::max(2, static_cast<int>(std::lround(typical_height * 0.25))) &&
+            b.y1 - a.y0 + 1 <= typical_height * 2.8;
         const bool join = a.region == b.region && !a.non_text_fragment && !b.non_text_fragment &&
-            !a.page_number && !b.page_number && ah <= fragment_height && bh <= fragment_height &&
-            gap >= 0 && gap <= fragment_gap && overlap_ratio >= 0.60 &&
-            b.y1 - a.y0 + 1 <= typical_height * 1.5;
+            !a.page_number && !b.page_number && (small_pair || detached_mark_pair) &&
+            gap >= 0 && overlap_ratio >= 0.60;
         if (!join) { ++i; continue; }
         a.x0 = std::min(a.x0, b.x0); a.y0 = std::min(a.y0, b.y0);
         a.x1 = std::max(a.x1, b.x1); a.y1 = std::max(a.y1, b.y1);
@@ -742,26 +791,48 @@ static void merge_short_line_fragments(std::vector<Band>& bands, int height) {
 }
 
 static void mark_uncertain_bands(std::vector<Band>& bands, int width, int height) {
-    int typical_height = 12;
-    std::vector<int> heights;
+    size_t region_count = 1;
+    for (const auto& b : bands) region_count = std::max(region_count, static_cast<size_t>(std::max(0, b.region)) + 1);
+    std::vector<std::vector<int>> heights_by_region(region_count);
     for (const auto& b : bands) {
         if (b.non_text_fragment || b.page_number) continue;
         const int bh = b.y1 - b.y0 + 1;
-        if (bh >= 4 && bh <= height * 0.08) heights.push_back(bh);
+        // Exclude likely multi-line outliers when estimating the local glyph
+        // scale; otherwise one merged band could teach its own region that it
+        // is normal-sized.
+        if (bh >= 4 && bh <= height * 0.08)
+            heights_by_region[static_cast<size_t>(std::max(0, b.region))].push_back(bh);
     }
-    if (!heights.empty()) {
-        std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
-        typical_height = heights[heights.size() / 2];
+    std::vector<int> typical_height(region_count, 12);
+    for (size_t region = 0; region < heights_by_region.size(); ++region) {
+        auto& values = heights_by_region[region];
+        if (values.empty()) continue;
+        auto middle = values.begin() + values.size() / 2;
+        std::nth_element(values.begin(), middle, values.end());
+        typical_height[region] = *middle;
     }
-    const int oversized = std::max(static_cast<int>(std::lround(typical_height * 1.8)),
-                                   static_cast<int>(std::lround(height * 0.025)));
-    const int edge_x = std::max(2, static_cast<int>(std::lround(width * 0.015)));
-    const int edge_y = std::max(2, static_cast<int>(std::lround(height * 0.04)));
+    const int edge_x = std::max(2, static_cast<int>(std::lround(width * 0.005)));
+    const int edge_y = std::max(2, static_cast<int>(std::lround(height * 0.008)));
     for (auto& b : bands) {
         if (b.non_text_fragment || b.page_number) continue;
         const int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
+        const int region_height = typical_height[static_cast<size_t>(std::max(0, b.region))];
+        const int oversized = std::max(static_cast<int>(std::lround(region_height * 1.8)),
+                                       static_cast<int>(std::lround(height * 0.025)));
         if (bh > oversized) b.review_reasons.emplace_back("possible_merged_or_oversized_line");
-        if (bw < width * 0.16 && b.components <= 5)
+
+        bool close_vertical_fragment = false;
+        for (const auto& other : bands) {
+            if (&other == &b || other.region != b.region || other.non_text_fragment || other.page_number) continue;
+            const int gap = other.y0 > b.y1 ? other.y0 - b.y1 - 1 :
+                            b.y0 > other.y1 ? b.y0 - other.y1 - 1 : -1;
+            if (gap < 0 || gap > std::max(2, static_cast<int>(std::lround(region_height * 0.35)))) continue;
+            const int overlap = std::max(0, std::min(b.x1, other.x1) - std::max(b.x0, other.x0) + 1);
+            const double ratio = static_cast<double>(overlap) / std::max(1, std::min(bw, other.x1 - other.x0 + 1));
+            if (ratio >= 0.60) { close_vertical_fragment = true; break; }
+        }
+        const bool unusually_short = bh < std::max(4, static_cast<int>(std::lround(region_height * 0.65)));
+        if (bw < width * 0.16 && b.components <= 5 && (unusually_short || close_vertical_fragment))
             b.review_reasons.emplace_back("short_or_fragmentary_text_candidate");
         if (b.x0 <= edge_x || b.y0 <= edge_y || b.x1 >= width - edge_x || b.y1 >= height - edge_y)
             b.review_reasons.emplace_back("possible_page_edge_clipping");
@@ -831,7 +902,7 @@ static Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--version") { std::cout << "linecrop 0.3.0\n"; std::exit(0); }
+        if (arg == "--version") { std::cout << "linecrop " << LINEFORGE_VERSION << "\n"; std::exit(0); }
         else if (arg == "--no-deskew") o.deskew = false;
         else if (arg == "--keep-page-numbers") o.filter_page_number = false;
         else if (arg == "--debug") o.debug = true;
@@ -991,7 +1062,7 @@ int main(int argc, char** argv) {
         fs::create_directories(opt.output);
         std::ofstream manifest(fs::path(opt.output) / "manifest.json");
         require(manifest.good(), "cannot create manifest in output directory");
-        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"0.3.0\",\n";
+        manifest << "{\n  \"engine\": \"linecrop\",\n  \"version\": \"" << LINEFORGE_VERSION << "\",\n";
         manifest << "  \"input\": \"" << json_escape(fs::path(opt.input).filename().string()) << "\",\n";
         manifest << "  \"image_size\": {\"width\": " << processed.width << ", \"height\": " << processed.height << "},\n";
         manifest << "  \"deskew_correction_degrees\": " << std::fixed << std::setprecision(3) << angle << ",\n";
@@ -1043,7 +1114,7 @@ int main(int argc, char** argv) {
                       << " output=" << ms(segmented, end) << "\n";
         }
         const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
-        std::cout << "linecrop 0.3.0 lines=" << kept << " excluded_candidates=" << skipped << " deskew_degrees=" << angle
+        std::cout << "linecrop " << LINEFORGE_VERSION << " lines=" << kept << " excluded_candidates=" << skipped << " deskew_degrees=" << angle
                   << " elapsed_ms=" << std::fixed << std::setprecision(2) << ms << " output=" << opt.output << "\n";
         return kept ? 0 : 2;
     } catch (const std::exception& e) {

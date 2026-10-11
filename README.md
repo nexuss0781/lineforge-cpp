@@ -8,13 +8,13 @@ A fast, deterministic C++ command-line tool that turns a scanned page image into
 
 - Reads JPEG and PNG pages and writes one PNG per detected text line.
 - Flattens slowly varying or colored illumination before adaptive local-contrast thresholding, with an Otsu-derived guard.
-- Combines text-region analysis, local row projections, low-density valleys, connected components, and observed line spacing to split dense blocks into lines.
+- Uses a page → whitespace-defined zones/blocks → line rows → per-line ink-bounds hierarchy; combines row-profile valleys, region-local line pitch, connected components, and the line's own vertical membership to split dense rows and constrain each horizontal crop.
 - Removes isolated scan specks while retaining small multi-pixel marks near glyphs; grayscale crops include extra space for detached Ethiopic marks.
 - Estimates mild page skew (search range ±5°) and deskews before layout and line analysis.
 - Separates text regions using recursive whitespace (XY-cut) analysis, so facing-page spreads, multi-column pages, and mixed newspaper blocks can be segmented in reading order.
 - Supports explicit, ordered rectangular regions for unusual/custom page designs and a left-to-right or right-to-left automatic column order.
 - Conservatively identifies centered lower-page number candidates and thin non-text fragments; excluded candidates remain in the manifest for review.
-- Marks kept crops that appear oversized, merged, fragmented, or close to a page edge with `review_required` and `review_reasons` metadata.
+- Marks kept crops that remain oversized/merged, structurally fragmentary, or actually touch a page edge with `review_required` and explainable `review_reasons`; scale checks are local to each block rather than page-wide.
 - Preserves the grayscale source pixels in each crop (except optional deskew interpolation); it does not invent or alter transcription labels.
 
 ## Build
@@ -47,7 +47,7 @@ Outputs are `line_0001.png`, `line_0002.png`, … and `manifest.json`. The manif
 
 ## Validation
 
-`tests/benchmark.py` runs **40 deterministic synthetic checks**: 24 pages (clean, low contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font/pseudo-Ethiopic text; three seeds per condition), two blank-page rejection cases, one 15.5-megapixel throughput case, a sparse row-noise case, a heading/underline/detached-mark/speck/footer case, four CLI/error-path checks, and seven layout-specific cases. It checks line count/order, crop size and files, footer handling, line repair, skew estimates, layout metadata, reading order, version reporting, and invalid-input handling. These tests are reproducible geometry stress tests, **not** a human-annotated accuracy benchmark or OCR evaluation.
+`tests/benchmark.py` runs **42 deterministic synthetic checks**: 24 pages (clean, low contrast, gradient illumination, sparse noise, blur, JPEG, mild skew, and Ethiopic-font/pseudo-Ethiopic text; three seeds per condition), two blank-page rejection cases, one 15.5-megapixel throughput case, sparse row-noise, dense close-pitch vertical-profile and top-edge clipping cases, a heading/underline/detached-mark/speck/footer case, four CLI/error-path checks, and seven layout-specific cases. It checks line count/order, crop size and files, footer handling, line repair, skew estimates, layout metadata, reading order, version reporting, and invalid-input handling. These tests are reproducible geometry stress tests, **not** a human-annotated accuracy benchmark or OCR evaluation.
 
 A separate evaluator scores manifests against hand-labeled line boxes. Example:
 
@@ -57,9 +57,9 @@ python3 tests/real_page_eval.py \
   --output-json report.json
 ```
 
-The input JSON contains `iou_threshold` (default `0.5`) and a `pages` array. Each page supplies a `manifest` path, `ground_truth_xyxy` boxes, and optionally an `roi_xyxy` region. Coordinates use the same half-open `xyxy` convention as the manifest. When an ROI is supplied, predicted boxes are included only when their centers fall inside it. The evaluator performs greedy one-to-one IoU matching and reports precision, recall, false positives, missed lines, cut-line indicators, merged crops, and split lines. A cut-line indicator is raised when an overlapping crop covers under 80% of a labeled line's width or under 50% of its height; merged/split counts use 20% overlap heuristics. Excluded candidates are not included in the predicted-crop count.
+The input JSON contains `iou_threshold` (default `0.5`) and a `pages` array. Each page supplies a `manifest` path, `ground_truth_xyxy` boxes, and optionally an `roi_xyxy` region. Coordinates use the same half-open `xyxy` convention as the manifest. When an ROI is supplied, predicted boxes are included only when their centers fall inside it. The evaluator performs greedy one-to-one IoU matching and reports precision, recall, false positives, missed lines, cut-line indicators, merged crops, and split lines. It also reports candidate review rate (including flagged excluded candidates), crop-error review recall, and error-page review recall. Crop-error recall covers measurable erroneous emitted crops; missed lines are instead counted in the page-level error/alert recall. A cut-line indicator is raised when an overlapping crop covers under 80% of a labeled line's width or under 50% of its height; split detection uses 20% coverage of a labeled line, while a merged crop must cover at least 15% of its own area or at least 50% of each affected line. Excluded candidates do not count as emitted crops, but they do count toward review workload.
 
-Label representative, held-out pages and ROIs; review overlay imagery; report the sample size and its scope. A score from a few selected blocks must not be generalized to every page or layout.
+Label representative, held-out pages and ROIs; review overlay imagery; report the sample size and its scope. A score from a few selected blocks must not be generalized to every page or layout. Review flags are not silently suppressed to reduce workload; tune them against held-out crop-error recall and error-page recall.
 
 ## Accuracy and limitations
 
