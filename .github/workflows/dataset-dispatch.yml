@@ -4,14 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       run_seed:
-        description: Private deterministic sampling seed for this approved run
+        description: Private deterministic seed from the approved Telegram job plan
         required: true
         type: string
       publish_to_hf:
-        description: Publish the validated 100,024-image output to the configured public Hugging Face dataset
+        description: Publish in-progress checkpoints to public main, then the validated 100,024-image release
         required: false
         default: false
         type: boolean
+      checkpoint_images:
+        description: Upload a progress checkpoint after this many newly accepted images
+        required: false
+        default: 5000
+        type: number
 
 permissions:
   contents: read
@@ -28,34 +33,53 @@ jobs:
     timeout-minutes: 360
     env:
       LINEFORGE_SOURCE_ROOT: ${{ vars.LINEFORGE_SOURCE_ROOT }}
-      LINEFORGE_OUTPUT_ROOT: ${{ vars.LINEFORGE_OUTPUT_ROOT }}
-      LINEFORGE_RUN_SEED: ${{ inputs.run_seed }}
       LINEFORGE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out LineForge
         uses: actions/checkout@v4
 
-      - name: Validate trusted runner staging
+      - name: Validate trusted runner staging and derive output root
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "$LINEFORGE_SOURCE_ROOT" || -z "$LINEFORGE_OUTPUT_ROOT" ]]; then
-            echo "Configure repository Actions variables LINEFORGE_SOURCE_ROOT and LINEFORGE_OUTPUT_ROOT on the dedicated runner."
+          if [[ -z "$LINEFORGE_SOURCE_ROOT" ]]; then
+            echo "Configure the repository Actions variable LINEFORGE_SOURCE_ROOT to the private staged source directory."
+            exit 1
+          fi
+          if [[ "$LINEFORGE_SOURCE_ROOT" != /* ]]; then
+            echo "LINEFORGE_SOURCE_ROOT must be an absolute path on the dedicated runner."
             exit 1
           fi
           [[ -d "$LINEFORGE_SOURCE_ROOT" ]]
           [[ -f "$LINEFORGE_SOURCE_ROOT/manifest.json" ]]
-          mkdir -p "$LINEFORGE_OUTPUT_ROOT"
           source_root="$(realpath "$LINEFORGE_SOURCE_ROOT")"
-          output_root="$(realpath "$LINEFORGE_OUTPUT_ROOT")"
           repo_root="$(realpath "$GITHUB_WORKSPACE")"
+          if [[ "$source_root" == / ]]; then
+            echo "The filesystem root cannot be used as the source directory."
+            exit 1
+          fi
           case "$source_root/" in
             "$repo_root/"*) echo "Source staging must be outside the checked-out repository."; exit 1 ;;
           esac
+          case "$repo_root/" in
+            "$source_root/"*) echo "Source staging must not contain the checked-out repository."; exit 1 ;;
+          esac
+
+          output_root="$(realpath -m "$(dirname "$source_root")/lineforge-output")"
           case "$output_root/" in
             "$repo_root/"*) echo "Dataset outputs must be outside the checked-out repository."; exit 1 ;;
             "$source_root/"*) echo "Dataset outputs must not be inside the private source tree."; exit 1 ;;
           esac
+          case "$source_root/" in
+            "$output_root/"*) echo "The private source tree must not be inside the dataset output tree."; exit 1 ;;
+          esac
+          mkdir -p "$output_root"
+          output_root="$(realpath "$output_root")"
+          case "$output_root/" in
+            "$repo_root/"*|"$source_root/"*) echo "Resolved dataset output path overlaps the checkout or private source tree."; exit 1 ;;
+          esac
+          printf 'LINEFORGE_OUTPUT_ROOT=%s\n' "$output_root" >> "$GITHUB_ENV"
+
           command -v cmake
           command -v c++
           command -v pdfinfo
@@ -70,21 +94,6 @@ jobs:
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
 
-      - name: Dispatch 19 workers and one live coordinator
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/lineforge_dataset.py dispatch \
-            --input-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
-            --source-root "$LINEFORGE_SOURCE_ROOT" \
-            --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
-            --run-seed "$LINEFORGE_RUN_SEED" \
-            --run-id "$LINEFORGE_RUN_ID" \
-            --linecrop "$GITHUB_WORKSPACE/build/linecrop" \
-            --target 100024 \
-            --dpi 300 \
-            --timeout-seconds 21600
-
       - name: Install optional Hugging Face publisher dependencies
         if: ${{ inputs.publish_to_hf }}
         shell: bash
@@ -95,21 +104,90 @@ jobs:
           "$publisher_venv/bin/python" -m pip install --disable-pip-version-check \
             -r "$GITHUB_WORKSPACE/requirements-hf-publish.txt"
 
-      - name: Publish validated dataset to Hugging Face
+      - name: Resolve the reviewed dataset license
+        if: ${{ inputs.publish_to_hf }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dataset_license="$(python3 - "$LINEFORGE_SOURCE_ROOT/manifest.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          manifest_path = sys.argv[1]
+          try:
+              with open(manifest_path, encoding="utf-8") as handle:
+                  manifest = json.load(handle)
+          except (OSError, ValueError) as exc:
+              raise SystemExit(f"Cannot read the reviewed source manifest: {exc}")
+          files = manifest.get("files") if isinstance(manifest, dict) else None
+          if not isinstance(files, list) or not files:
+              raise SystemExit("The reviewed source manifest has no eligible source entries.")
+
+          licenses = set()
+          for index, source in enumerate(files, start=1):
+              rights = source.get("redistribution") if isinstance(source, dict) else None
+              license_id = rights.get("dataset_license") if isinstance(rights, dict) else None
+              if not isinstance(license_id, str) or not license_id.strip():
+                  raise SystemExit(f"Eligible source {index} has no reviewed dataset_license clearance.")
+              license_id = license_id.strip()
+              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,63}", license_id):
+                  raise SystemExit(f"Eligible source {index} has an invalid dataset_license identifier.")
+              licenses.add(license_id)
+
+          if len(licenses) != 1:
+              raise SystemExit("All eligible sources must explicitly clear the same dataset license before publication.")
+          print(next(iter(licenses)))
+          PY
+          )"
+          printf 'LINEFORGE_DATASET_LICENSE=%s\n' "$dataset_license" >> "$GITHUB_ENV"
+
+      - name: Dispatch 19 workers and one live coordinator
+        env:
+          LINEFORGE_RUN_SEED: ${{ inputs.run_seed }}
+          PUBLISH_TO_HF: ${{ inputs.publish_to_hf }}
+          HF_CHECKPOINT_IMAGES: ${{ inputs.checkpoint_images }}
+          LINEFORGE_DATASET_LICENSE: ${{ env.LINEFORGE_DATASET_LICENSE }}
+          HF_TOKEN: ${{ inputs.publish_to_hf && secrets.HF_TOKEN || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$LINEFORGE_RUN_SEED"
+          dispatch_python=python3
+          publish_args=()
+          if [[ "$PUBLISH_TO_HF" == "true" ]]; then
+            if [[ -z "${HF_TOKEN:-}" ]]; then
+              echo "Periodic publication requires the repository Actions secret HF_TOKEN."
+              exit 1
+            fi
+            dispatch_python="$RUNNER_TEMP/lineforge-hf-publisher/bin/python"
+            publish_args+=(--publish-progress \
+              --dataset-license "$LINEFORGE_DATASET_LICENSE" \
+              --progress-every-images "$HF_CHECKPOINT_IMAGES" \
+              --card-template "$GITHUB_WORKSPACE/docs/huggingface-dataset-card.template.md")
+          fi
+          "$dispatch_python" scripts/lineforge_dataset.py dispatch \
+            --input-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
+            --source-root "$LINEFORGE_SOURCE_ROOT" \
+            --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
+            --run-seed "$LINEFORGE_RUN_SEED" \
+            --run-id "$LINEFORGE_RUN_ID" \
+            --linecrop "$GITHUB_WORKSPACE/build/linecrop" \
+            --target 100024 \
+            --dpi 300 \
+            --timeout-seconds 21600 \
+            "${publish_args[@]}"
+
+      - name: Publish final validated dataset to Hugging Face main revision
         if: ${{ inputs.publish_to_hf }}
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
-          HF_DATASET_LICENSE: ${{ vars.HF_DATASET_LICENSE }}
+          LINEFORGE_DATASET_LICENSE: ${{ env.LINEFORGE_DATASET_LICENSE }}
         run: |
           set -euo pipefail
           if [[ -z "${HF_TOKEN:-}" ]]; then
             echo "The gated publisher requires the repository Actions secret HF_TOKEN."
-            exit 1
-          fi
-          if [[ -z "${HF_DATASET_REPO:-}" || -z "${HF_DATASET_LICENSE:-}" ]]; then
-            echo "Configure the repository Actions variables HF_DATASET_REPO and HF_DATASET_LICENSE after the rights and license review."
             exit 1
           fi
           "$RUNNER_TEMP/lineforge-hf-publisher/bin/python" \
@@ -117,8 +195,8 @@ jobs:
             --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
             --source-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
             --source-root "$LINEFORGE_SOURCE_ROOT" \
-            --repo-id "$HF_DATASET_REPO" \
-            --dataset-license "$HF_DATASET_LICENSE" \
+            --repo-id Nexuss0781/Geez-OCR-Dataset \
+            --dataset-license "$LINEFORGE_DATASET_LICENSE" \
             --card-template "$GITHUB_WORKSPACE/docs/huggingface-dataset-card.template.md" \
             --target 100024 \
             --confirm-publish

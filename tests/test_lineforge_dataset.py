@@ -15,8 +15,9 @@ from scripts.lineforge_dataset import (
     dispatch_local_run,
     QuotaLedger,
     assign_pdf_shards,
+    randomized_page_queue,
     crop_acceptance_reason,
-    middle_page_order,
+    random_page_order,
     monitor_local_workers,
     require_hf_token,
     reduce_worker_results,
@@ -142,18 +143,35 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len(flattened), 407)
         self.assertEqual(len(set(flattened)), 407)
         self.assertEqual(len(first), 19)
+        counts = [len(shard) for shard in first]
+        self.assertEqual(counts.count(22), 8)
+        self.assertEqual(counts.count(21), 11)
         self.assertLess(max(sum(item["page_count"] for item in shard) for shard in first),
                         2 * min(sum(item["page_count"] for item in shard) for shard in first))
 
-    def test_page_sampling_is_seeded_middle_only_unique_and_starts_at_ten(self) -> None:
+    def test_seeded_shards_and_page_queue_are_repeatable_and_interleaved(self) -> None:
+        entries = [
+            {"pdf_id": f"telegram-{i}", "pdf_sha256": digest(f"pdf-{i}"), "page_count": 100}
+            for i in range(4)
+        ]
+        one = list(randomized_page_queue(entries, "seed-one", 0))
+        repeat = list(randomized_page_queue(entries, "seed-one", 0))
+        changed = list(randomized_page_queue(entries, "seed-two", 0))
+        self.assertEqual(one, repeat)
+        self.assertNotEqual(one, changed)
+        self.assertEqual({pdf["pdf_id"] for pdf, _page in one[:4]}, {row["pdf_id"] for row in entries})
+        self.assertEqual(len({(pdf["pdf_id"], page) for pdf, page in one}), len(one))
+        self.assertTrue(all(10 <= page <= 100 for _pdf, page in one))
+
+    def test_page_sampling_is_seeded_unique_and_covers_opening_middle_and_ending_from_page_ten(self) -> None:
         pdf_hash = digest("book")
-        first = middle_page_order(100, "run-A", pdf_hash)
-        self.assertEqual(first, middle_page_order(100, "run-A", pdf_hash))
-        self.assertNotEqual(first, middle_page_order(100, "run-B", pdf_hash))
+        first = random_page_order(100, "run-A", pdf_hash)
+        self.assertEqual(first, random_page_order(100, "run-A", pdf_hash))
+        self.assertNotEqual(first, random_page_order(100, "run-B", pdf_hash))
         self.assertEqual(len(first), len(set(first)))
-        self.assertTrue(all(25 <= page <= 75 for page in first))
-        self.assertTrue(all(page >= 10 for page in middle_page_order(12, "short-book", pdf_hash)))
-        self.assertEqual(middle_page_order(9, "tiny-book", pdf_hash), [])
+        self.assertEqual(set(first), set(range(10, 101)))
+        self.assertTrue(all(page >= 10 for page in random_page_order(12, "short-book", pdf_hash)))
+        self.assertEqual(random_page_order(9, "tiny-book", pdf_hash), [])
 
 
 class CropFilterTests(unittest.TestCase):
@@ -393,6 +411,7 @@ class DispatcherIntegrationTests(unittest.TestCase):
             self.assertFalse(result["publishable"])
             self.assertEqual(len(list((run_dir / "dataset" / "workers").glob("worker-*.json"))), 19)
             self.assertTrue((run_dir / "dataset-manifest.json").is_file())
+            self.assertTrue((run_dir / "stop-workers").is_file())
             with self.assertRaises(FileExistsError):
                 dispatch_local_run(
                     manifest_path, source_root, run_dir, "integration-seed", "integration-run-2",

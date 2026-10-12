@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed Hugging Face publisher for validated LineForge dataset runs.
 
-The default workflow is local-only preflight. A remote upload requires both an
-explicit --confirm-publish CLI choice and HF_TOKEN in the environment. The
+The default workflow is local-only preflight. A main-revision upload requires
+--confirm-publish and HF_TOKEN; progress uploads require the dispatcher's
+explicit --publish-progress option and the same source-rights clearance. The
 publisher never uploads private source manifests, worker results, quota data,
 source identifiers, source checksums, or rights-evidence references.
 """
@@ -174,6 +175,192 @@ def _render_card(card_template: Path, dataset_license: str) -> str:
     return card
 
 
+def validate_progress_clearance(
+    source_manifest_path: Path,
+    source_root: Path,
+    dataset_license: str,
+) -> list[dict[str, Any]]:
+    """Fail closed unless every eligible source explicitly clears one exact license."""
+    if not isinstance(dataset_license, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,63}", dataset_license):
+        raise ValueError("a single explicit dataset license identifier is required")
+    source_root = _require_directory(source_root, "private source root")
+    source_manifest_path = _require_file(source_manifest_path, "private source manifest")
+    try:
+        source_manifest_path.relative_to(source_root)
+    except ValueError as exc:
+        raise ValueError("private source manifest is outside the configured source root") from exc
+    entries = validate_source_manifest(
+        load_json(source_manifest_path), source_manifest_path.parent,
+        verify_files=True, allowed_root=source_root,
+    )
+    if not entries:
+        raise ValueError("no rights-cleared eligible source PDFs are present")
+    for source in entries:
+        rights = source.get("redistribution")
+        if not isinstance(rights, dict) or rights.get("dataset_license") != dataset_license:
+            raise ValueError("every eligible source must explicitly clear the selected dataset license")
+    return entries
+
+
+class ProgressPublisher:
+    """Commit periodic sanitized snapshots directly to the public dataset main revision."""
+
+    def __init__(
+        self,
+        api: Any,
+        run_id: str,
+        dataset_license: str,
+        card_template: Path,
+        source_entries: list[dict[str, Any]],
+        *,
+        repo_id: str = HF_DATASET_REPO,
+    ) -> None:
+        if repo_id != HF_DATASET_REPO:
+            raise ValueError("progress publication is restricted to the configured dataset repository")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
+            raise ValueError("run_id is malformed")
+        if not isinstance(dataset_license, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,63}", dataset_license):
+            raise ValueError("a single explicit dataset license identifier is required")
+        self.api = api
+        self.run_id = run_id
+        self.dataset_license = dataset_license
+        self.sources_by_hash = {row["pdf_sha256"]: row for row in source_entries}
+        if not self.sources_by_hash or len(self.sources_by_hash) != len(source_entries):
+            raise ValueError("progress publication requires a non-empty reviewed source manifest")
+        self.card = _render_card(card_template, dataset_license)
+        self.repo_id = repo_id
+        self.revision = "main"
+        self.last_sequence = 0
+        try:
+            info = api.repo_info(repo_id=repo_id, repo_type="dataset")
+            is_private = info.get("private") if isinstance(info, dict) else getattr(info, "private", None)
+            if is_private is not False:
+                raise RuntimeError("target repository must already exist and be public")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Hugging Face progress setup stopped ({type(exc).__name__})") from None
+
+    def publish_checkpoint(self, ledger: Any) -> dict[str, Any]:
+        records = ledger.records()
+        if len(records) > ledger.target:
+            raise ValueError("progress quota ledger exceeds its configured target")
+        seen_hashes: set[str] = set()
+        seen_provenance: set[tuple[str, int, int]] = set()
+        for sequence, row in enumerate(records, start=1):
+            if row.get("sequence") != sequence or not _valid_sha256(row.get("image_sha256")):
+                raise ValueError("progress quota ledger has malformed sequence or image checksum data")
+            image_hash = row["image_sha256"]
+            source_hash = row.get("source_pdf_sha256")
+            if not isinstance(source_hash, str):
+                raise ValueError("progress image source checksum is malformed")
+            source = self.sources_by_hash.get(source_hash)
+            if source is None:
+                raise ValueError("progress image refers to a source outside the reviewed manifest")
+            rights = source["redistribution"]
+            page_number = row.get("page_number")
+            line_index = row.get("line_index")
+            if type(page_number) is not int or type(line_index) is not int:
+                raise ValueError("progress image page and line values are malformed")
+            provenance = (source_hash, page_number, line_index)
+            expected_path = f"images/{source['public_source_slug']}/page-{page_number:05d}/line-{line_index:06d}-{image_hash[:12]}.png"
+            if (
+                image_hash in seen_hashes
+                or provenance in seen_provenance
+                or row.get("source_pdf_id") != source["pdf_id"]
+                or row.get("source_book_name") != source["public_source_name"]
+                or row.get("source_book_slug") != source["public_source_slug"]
+                or row.get("source_license") != rights["license"]
+                or row.get("rights_evidence_ref") != rights["evidence_ref"]
+                or page_number < MIN_PAGE or page_number > source["page_count"]
+                or line_index < 1
+                or type(row.get("shard_id")) is not int or not 0 <= row["shard_id"] < WORKER_COUNT
+                or row.get("relative_path") != expected_path
+            ):
+                raise ValueError("progress image provenance does not match source-specific rights clearance")
+            seen_hashes.add(image_hash)
+            seen_provenance.add(provenance)
+        new_records = [row for row in records if row["sequence"] > self.last_sequence]
+        if not new_records:
+            return {"status": "no_new_images", "image_count": len(records), "revision": self.revision}
+        images_root = _require_directory(ledger.output_dir / "images", "checkpoint image directory")
+        stage_parent = ledger.output_dir.parent
+        try:
+            with tempfile.TemporaryDirectory(prefix=".lineforge-progress-", dir=stage_parent) as temporary:
+                stage = Path(temporary)
+                staged_images = stage / "images"
+                staged_images.mkdir()
+                for row in new_records:
+                    relative = Path(row["relative_path"])
+                    if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "images":
+                        raise ValueError("checkpoint image path is unsafe")
+                    source = ledger.output_dir / relative
+                    if source.is_symlink() or not source.is_file() or sha256_file(source) != row["image_sha256"]:
+                        raise ValueError("checkpoint image is missing, unsafe, or has changed")
+                    try:
+                        source.resolve(strict=True).relative_to(images_root.resolve(strict=True))
+                    except ValueError as exc:
+                        raise ValueError("checkpoint image resolves outside the image directory") from exc
+                    destination = staged_images / Path(*relative.parts[1:])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(source, destination, follow_symlinks=False)
+
+                public_index = {
+                    "schema_version": 1,
+                    "dataset_license": self.dataset_license,
+                    "image_count": len(records),
+                    "target_image_count": ledger.target,
+                    "release_status": "in_progress",
+                    "images": [
+                        {
+                            "path": row["relative_path"],
+                            "sha256": row["image_sha256"],
+                            "source_book": row["source_book_name"],
+                            "page_number": row["page_number"],
+                            "line_index": row["line_index"],
+                        }
+                        for row in records
+                    ],
+                }
+                metadata = stage / "metadata"
+                metadata.mkdir()
+                card = self.card + (
+                    f"\n## Release progress\n\nThe dataset's main revision currently contains an in-progress checkpoint of "
+                    f"{len(records)} of {ledger.target} target line images. The release will be marked complete only after final validation.\n"
+                )
+                (metadata / "README.md").write_text(card, encoding="utf-8")
+                (metadata / PUBLIC_INDEX_NAME).write_text(
+                    json.dumps(public_index, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                self.api.upload_folder(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    revision=self.revision,
+                    folder_path=str(staged_images),
+                    path_in_repo="images",
+                    commit_message=f"LineForge in-progress checkpoint: {len(new_records)} new images",
+                )
+                self.api.upload_folder(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    revision=self.revision,
+                    folder_path=str(metadata),
+                    commit_message=f"Update in-progress LineForge index ({len(records)} images)",
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Hugging Face progress checkpoint stopped ({type(exc).__name__})") from None
+        self.last_sequence = max(row["sequence"] for row in new_records)
+        return {
+            "status": "checkpoint_uploaded",
+            "image_count": len(records),
+            "new_images": len(new_records),
+            "revision": self.revision,
+        }
+
+
 def validate_publication(
     run_dir: Path,
     source_manifest_path: Path,
@@ -336,6 +523,8 @@ def validate_publication(
         "schema_version": 1,
         "dataset_license": dataset_license,
         "image_count": expected_target,
+        "target_image_count": expected_target,
+        "release_status": "complete",
         "images": [
             {
                 "path": row["relative_path"],
@@ -439,6 +628,7 @@ def publish_dataset(
         api.upload_folder(
             repo_id=repo_id,
             repo_type="dataset",
+            revision="main",
             folder_path=str(payload),
             commit_message="Publish validated LineForge dataset release",
         )
