@@ -187,29 +187,68 @@ def validate_source_manifest(
     return [entry for entry in accepted if entry["eligible"]]
 
 
-def assign_pdf_shards(files: Iterable[dict[str, Any]], shard_count: int = WORKER_COUNT) -> list[list[dict[str, Any]]]:
-    """Balance whole PDFs by page count with a stable largest-processing-first rule."""
+def _assignment_key(item: dict[str, Any]) -> str:
+    """Use the same stable identity before and after Telegram PDF staging."""
+    pdf_id = item.get("pdf_id")
+    if isinstance(pdf_id, str) and pdf_id.strip():
+        return pdf_id
+    message_id = item.get("message_id")
+    if type(message_id) is int and message_id > 0:
+        return f"telegram-{message_id}"
+    digest = item.get("pdf_sha256")
+    if isinstance(digest, str) and digest:
+        return digest
+    raise ValueError("each assigned PDF needs a stable pdf_id, Telegram message_id, or checksum")
+
+
+def assign_even_shards(
+    files: Iterable[dict[str, Any]],
+    shard_count: int = WORKER_COUNT,
+    run_seed: str = "",
+) -> list[list[dict[str, Any]]]:
+    """Assign every whole PDF once, with shard PDF counts differing by at most one."""
     if shard_count != WORKER_COUNT:
         raise ValueError("LineForge dataset pipeline requires exactly 19 worker shards")
+    if not isinstance(run_seed, str):
+        raise ValueError("run_seed must be a string")
     entries = list(files)
-    if len({item["pdf_sha256"] for item in entries}) != len(entries):
-        raise ValueError("duplicate PDF content would be assigned more than once")
+    keys = [_assignment_key(item) for item in entries]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate PDF identities would be assigned more than once")
+    entries.sort(key=_assignment_key)
+    if run_seed:
+        seed = int.from_bytes(hashlib.sha256(run_seed.encode("utf-8")).digest(), "big")
+        random.Random(seed).shuffle(entries)
     shards: list[list[dict[str, Any]]] = [[] for _ in range(shard_count)]
-    page_loads = [0] * shard_count
-    for item in sorted(entries, key=lambda row: (-row["page_count"], row["pdf_sha256"])):
-        shard = min(range(shard_count), key=lambda sid: (page_loads[sid], sid))
-        shards[shard].append(item)
-        page_loads[shard] += item["page_count"]
+    for index, item in enumerate(entries):
+        shards[index % shard_count].append(item)
+    counts = [len(shard) for shard in shards]
+    if entries and max(counts) - min(counts) > 1:
+        raise AssertionError("internal error: equal-count shard assignment is unbalanced")
+    return shards
+
+
+def assign_pdf_shards(
+    files: Iterable[dict[str, Any]],
+    shard_count: int = WORKER_COUNT,
+    run_seed: str = "",
+) -> list[list[dict[str, Any]]]:
+    """Create exactly 19 count-balanced whole-PDF shards in seeded assignment order."""
+    entries = list(files)
+    hashes = [item.get("pdf_sha256") for item in entries]
+    if len(set(hashes)) != len(hashes):
+        raise ValueError("duplicate PDF content would be assigned more than once")
+    shards = assign_even_shards(entries, shard_count, run_seed)
     for shard in shards:
-        shard.sort(key=lambda row: row["pdf_sha256"])
+        shard.sort(key=lambda row: (row["pdf_sha256"], _assignment_key(row)))
     assigned = [item["pdf_sha256"] for shard in shards for item in shard]
     if len(assigned) != len(entries) or len(set(assigned)) != len(assigned):
         raise AssertionError("internal error: shard assignment is not exact and disjoint")
     return shards
 
 
-def middle_page_order(page_count: int, run_seed: str, pdf_sha256: str) -> list[int]:
-    """Return a deterministic random ordering of unique, one-based middle pages >=10."""
+def random_page_order(page_count: int, run_seed: str, pdf_sha256: str) -> list[int]:
+    """Return a seeded permutation of every one-based book page from page 10 onward."""
     if type(page_count) is not int or page_count < 1:
         raise ValueError("page_count must be positive")
     if not isinstance(run_seed, str) or not run_seed:
@@ -218,16 +257,46 @@ def middle_page_order(page_count: int, run_seed: str, pdf_sha256: str) -> list[i
         raise ValueError("pdf_sha256 must be a SHA-256 digest")
     if page_count < MIN_PAGE:
         return []
-    middle_start = max(MIN_PAGE, math.ceil(page_count * 0.25))
-    middle_end = min(page_count, math.floor(page_count * 0.75))
-    if middle_start > middle_end:
-        middle_start = MIN_PAGE
-        middle_end = page_count
-    pages = list(range(middle_start, middle_end + 1))
+    pages = list(range(MIN_PAGE, page_count + 1))
     seed_material = f"{run_seed}\0{pdf_sha256}".encode("utf-8")
     seed = int.from_bytes(hashlib.sha256(seed_material).digest(), "big")
     random.Random(seed).shuffle(pages)
     return pages
+
+
+def randomized_page_queue(
+    files: Iterable[dict[str, Any]],
+    run_seed: str,
+    shard_id: int,
+) -> Iterable[tuple[dict[str, Any], int]]:
+    """Yield a seeded, interleaved page order so PDFs are sampled fairly within a shard."""
+    if not isinstance(run_seed, str) or not run_seed:
+        raise ValueError("run_seed must be a non-empty string")
+    if type(shard_id) is not int or not 0 <= shard_id < WORKER_COUNT:
+        raise ValueError("shard_id must be between 0 and 18")
+    entries = sorted(list(files), key=_assignment_key)
+    keys = [_assignment_key(item) for item in entries]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate PDF identities cannot enter a page queue")
+    page_orders = [
+        random_page_order(item["page_count"], run_seed, item["pdf_sha256"])
+        for item in entries
+    ]
+    active = [index for index, pages in enumerate(page_orders) if pages]
+    positions = [0] * len(entries)
+    seed_material = f"{run_seed}\0shard-{shard_id}".encode("utf-8")
+    rng_seed = int.from_bytes(hashlib.sha256(seed_material).digest(), "big")
+    rng = random.Random(rng_seed)
+    while active:
+        rng.shuffle(active)
+        next_round: list[int] = []
+        for index in active:
+            position = positions[index]
+            yield entries[index], page_orders[index][position]
+            positions[index] += 1
+            if positions[index] < len(page_orders[index]):
+                next_round.append(index)
+        active = next_round
 
 
 def crop_acceptance_reason(image_path: Path, line_metadata: dict[str, Any]) -> tuple[bool, str]:
@@ -439,7 +508,13 @@ def load_shard_identity(shards_dir: Path) -> tuple[str, str]:
     return run_id, manifest_sha256
 
 
-def monitor_local_workers(ledger: QuotaLedger, results_dir: Path, poll_seconds: int = 5, timeout_seconds: int = 21_600) -> dict[str, int | str]:
+def monitor_local_workers(
+    ledger: QuotaLedger,
+    results_dir: Path,
+    poll_seconds: int = 5,
+    timeout_seconds: int = 21_600,
+    stop_file: Path | None = None,
+) -> dict[str, int | str]:
     """Monitor colocated workers; this cannot monitor isolated GitHub-hosted filesystems."""
     if poll_seconds < 1 or timeout_seconds < 1:
         raise ValueError("poll and timeout values must be positive")
@@ -448,6 +523,8 @@ def monitor_local_workers(ledger: QuotaLedger, results_dir: Path, poll_seconds: 
         count = ledger.count()
         if count > ledger.target:
             raise ValueError("shared quota ledger exceeded its configured target")
+        if count == ledger.target and stop_file is not None and not stop_file.exists():
+            atomic_write(stop_file, f"target_reached={ledger.target}\n".encode("ascii"))
         result_files = sorted(results_dir.glob("worker-*.json")) if results_dir.exists() else []
         print(f"live unique images: {count}/{ledger.target}; worker results: {len(result_files)}/{WORKER_COUNT}", flush=True)
         if len(result_files) > WORKER_COUNT:
@@ -482,7 +559,7 @@ def prepare_shard_manifests(
     if not entries:
         raise ValueError("no Status=true PDFs with at least 10 pages are eligible")
     input_digest = sha256_file(input_path)
-    shards = assign_pdf_shards(entries)
+    shards = assign_pdf_shards(entries, run_seed=run_seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     for shard_id, shard_entries in enumerate(shards):
         payload = {
@@ -501,6 +578,8 @@ def prepare_shard_manifests(
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "run_seed": run_seed,
+        "assignment_strategy": "seeded_equal_pdf_count_round_robin",
+        "page_sampling_strategy": "seeded_random_interleaving_across_assigned_pdfs",
         "worker_count": WORKER_COUNT,
         "source_manifest_sha256": input_digest,
         "eligible_pdf_count": len(entries),
@@ -533,6 +612,7 @@ def process_shard(
     ledger_path: Path,
     target: int = DEFAULT_TARGET,
     dpi: int = 300,
+    stop_file: Path | None = None,
 ) -> Path:
     shard_doc = load_json(shard_manifest_path)
     if shard_doc.get("schema_version") != SCHEMA_VERSION or shard_doc.get("worker_count") != WORKER_COUNT:
@@ -559,95 +639,100 @@ def process_shard(
     failures: list[str] = []
     stopped_at_quota = False
 
-    for pdf in files:
-        if ledger.count() >= target:
-            stopped_at_quota = True
+    seen_pdf_hashes: set[str] = set()
+    for pdf, page_number in randomized_page_queue(files, run_seed, shard_id):
+        if ledger.count() >= target or (stop_file is not None and stop_file.exists()):
+            stopped_at_quota = ledger.count() >= target
             break
         pdf_path = Path(pdf["path"])
+        pdf_hash = pdf["pdf_sha256"]
         rights = pdf.get("redistribution")
-        if (
-            not isinstance(pdf.get("pdf_id"), str)
-            or not isinstance(rights, dict)
-            or rights.get("allowed") is not True
-            or not isinstance(rights.get("license"), str)
-            or not rights["license"].strip()
-            or not isinstance(rights.get("evidence_ref"), str)
-            or not rights["evidence_ref"].strip()
-        ):
-            raise ValueError("shard source lacks explicit redistribution rights provenance")
-        if not pdf_path.is_file() or sha256_file(pdf_path) != pdf["pdf_sha256"]:
-            raise ValueError("staged PDF is missing or its source checksum changed")
-        actual_pages = _pdf_page_count(pdf_path)
-        if actual_pages != pdf["page_count"]:
-            raise ValueError("staged PDF page count differs from the immutable manifest")
-        page_count_checked.add(pdf["pdf_sha256"])
-        pdfs_processed += 1
-        for page_number in middle_page_order(pdf["page_count"], run_seed, pdf["pdf_sha256"]):
-            if ledger.count() >= target:
-                stopped_at_quota = True
+        if pdf_hash not in seen_pdf_hashes:
+            if (
+                not isinstance(pdf.get("pdf_id"), str)
+                or not isinstance(rights, dict)
+                or rights.get("allowed") is not True
+                or not isinstance(rights.get("license"), str)
+                or not rights["license"].strip()
+                or not isinstance(rights.get("evidence_ref"), str)
+                or not rights["evidence_ref"].strip()
+            ):
+                raise ValueError("shard source lacks explicit redistribution rights provenance")
+            if not pdf_path.is_file() or sha256_file(pdf_path) != pdf_hash:
+                raise ValueError("staged PDF is missing or its source checksum changed")
+            actual_pages = _pdf_page_count(pdf_path)
+            if actual_pages != pdf["page_count"]:
+                raise ValueError("staged PDF page count differs from the immutable manifest")
+            seen_pdf_hashes.add(pdf_hash)
+            page_count_checked.add(pdf_hash)
+            pdfs_processed += 1
+
+        if ledger.count() >= target or (stop_file is not None and stop_file.exists()):
+            stopped_at_quota = ledger.count() >= target
+            break
+        page_work = work_dir / run_id / f"shard-{shard_id:02d}" / pdf_hash / f"page-{page_number:05d}"
+        page_work.mkdir(parents=True, exist_ok=True)
+        page_base = page_work / "source-page"
+        rendered_path = Path(str(page_base) + ".png")
+        try:
+            render = subprocess.run(
+                ["pdftoppm", "-f", str(page_number), "-l", str(page_number), "-singlefile", "-png", "-r", str(dpi), str(pdf_path), str(page_base)],
+                text=True, capture_output=True, check=False, timeout=600,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"page render timed out for page {page_number}") from exc
+        if render.returncode != 0 or not rendered_path.is_file():
+            raise RuntimeError(f"page render failed for page {page_number}; source content was not accepted")
+        if ledger.count() >= target or (stop_file is not None and stop_file.exists()):
+            stopped_at_quota = ledger.count() >= target
+            break
+        crop_dir = page_work / "crops"
+        try:
+            proc = subprocess.run(
+                [str(linecrop_binary), "--input", str(rendered_path), "--output", str(crop_dir), "--layout", "auto"],
+                text=True, capture_output=True, check=False, timeout=600,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"LineForge timed out on source page {page_number}") from exc
+        page_manifest_path = crop_dir / "manifest.json"
+        if proc.returncode not in (0, 2) or not page_manifest_path.is_file():
+            raise RuntimeError(f"LineForge failed on source page {page_number}; source content was not accepted")
+        page_manifest = load_json(page_manifest_path)
+        lines = page_manifest.get("lines")
+        if not isinstance(lines, list):
+            raise ValueError("LineForge page manifest has no lines array")
+        pages_processed += 1
+        for line_index, line in enumerate(lines, start=1):
+            if ledger.count() >= target or (stop_file is not None and stop_file.exists()):
+                stopped_at_quota = ledger.count() >= target
                 break
-            page_work = work_dir / run_id / f"shard-{shard_id:02d}" / pdf["pdf_sha256"] / f"page-{page_number:05d}"
-            page_work.mkdir(parents=True, exist_ok=True)
-            page_base = page_work / "source-page"
-            rendered_path = Path(str(page_base) + ".png")
+            if not isinstance(line, dict) or not isinstance(line.get("file"), str):
+                raise ValueError("LineForge emitted a malformed line entry")
+            crop_path = crop_dir / line["file"]
             try:
-                render = subprocess.run(
-                    ["pdftoppm", "-f", str(page_number), "-l", str(page_number), "-singlefile", "-png", "-r", str(dpi), str(pdf_path), str(page_base)],
-                    text=True, capture_output=True, check=False, timeout=600,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"page render timed out for page {page_number}") from exc
-            if render.returncode != 0 or not rendered_path.is_file():
-                raise RuntimeError(f"page render failed for page {page_number}; source content was not accepted")
-            crop_dir = page_work / "crops"
-            try:
-                proc = subprocess.run(
-                    [str(linecrop_binary), "--input", str(rendered_path), "--output", str(crop_dir), "--layout", "auto"],
-                    text=True, capture_output=True, check=False, timeout=600,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"LineForge timed out on source page {page_number}") from exc
-            page_manifest_path = crop_dir / "manifest.json"
-            if proc.returncode not in (0, 2) or not page_manifest_path.is_file():
-                raise RuntimeError(f"LineForge failed on source page {page_number}; source content was not accepted")
-            page_manifest = load_json(page_manifest_path)
-            lines = page_manifest.get("lines")
-            if not isinstance(lines, list):
-                raise ValueError("LineForge page manifest has no lines array")
-            pages_processed += 1
-            for line_index, line in enumerate(lines, start=1):
-                if ledger.count() >= target:
-                    stopped_at_quota = True
-                    break
-                if not isinstance(line, dict) or not isinstance(line.get("file"), str):
-                    raise ValueError("LineForge emitted a malformed line entry")
-                crop_path = crop_dir / line["file"]
-                try:
-                    crop_path.resolve().relative_to(crop_dir.resolve())
-                except ValueError as exc:
-                    raise ValueError("LineForge line path escapes the page crop directory") from exc
-                accepted, reason = crop_acceptance_reason(crop_path, line)
-                if not accepted:
-                    skipped_review += 1
-                    continue
-                result = ledger.accept(crop_path, {
-                    "source_pdf_sha256": pdf["pdf_sha256"],
-                    "source_pdf_id": pdf["pdf_id"],
-                    "source_book_name": pdf["public_source_name"],
-                    "source_book_slug": pdf["public_source_slug"],
-                    "page_number": page_number,
-                    "line_index": line_index,
-                    "shard_id": shard_id,
-                    "engine_version": page_manifest.get("version", ENGINE_VERSION),
-                    "source_license": pdf["redistribution"]["license"],
-                    "rights_evidence_ref": pdf["redistribution"]["evidence_ref"],
-                })
-                if result.startswith("duplicate"):
-                    skipped_duplicate += 1
-                if result == "target_reached":
-                    stopped_at_quota = True
-                    break
-            if stopped_at_quota:
+                crop_path.resolve().relative_to(crop_dir.resolve())
+            except ValueError as exc:
+                raise ValueError("LineForge line path escapes the page crop directory") from exc
+            accepted, reason = crop_acceptance_reason(crop_path, line)
+            if not accepted:
+                skipped_review += 1
+                continue
+            result = ledger.accept(crop_path, {
+                "source_pdf_sha256": pdf_hash,
+                "source_pdf_id": pdf["pdf_id"],
+                "source_book_name": pdf["public_source_name"],
+                "source_book_slug": pdf["public_source_slug"],
+                "page_number": page_number,
+                "line_index": line_index,
+                "shard_id": shard_id,
+                "engine_version": page_manifest.get("version", ENGINE_VERSION),
+                "source_license": rights["license"],
+                "rights_evidence_ref": rights["evidence_ref"],
+            })
+            if result.startswith("duplicate"):
+                skipped_duplicate += 1
+            if result == "target_reached":
+                stopped_at_quota = True
                 break
         if stopped_at_quota:
             break
@@ -704,13 +789,17 @@ def dispatch_local_run(
     dpi: int = 300,
     poll_seconds: int = 5,
     timeout_seconds: int = 21_600,
+    publish_progress: bool = False,
+    dataset_license: str | None = None,
+    progress_every_images: int = 5_000,
+    card_template: Path | None = None,
 ) -> dict[str, Any]:
     """Run 19 local workers and one local coordinator against one shared ledger."""
     if not run_seed.strip():
         raise ValueError("run_seed must be non-empty")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id):
         raise ValueError("run_id must use 1-128 letters, digits, dots, underscores, or hyphens")
-    if target < 1 or dpi < 72 or dpi > 600 or poll_seconds < 1 or timeout_seconds < 1:
+    if target < 1 or dpi < 72 or dpi > 600 or poll_seconds < 1 or timeout_seconds < 1 or progress_every_images < 1:
         raise ValueError("target and poll/timeout values must be positive; DPI must be between 72 and 600")
     source_root = source_root.resolve()
     input_manifest = input_manifest.resolve()
@@ -738,8 +827,28 @@ def dispatch_local_run(
     output_dir = run_dir / "dataset"
     ledger_path = run_dir / "quota.sqlite"
     results_dir = output_dir / "workers"
+    stop_file = run_dir / "stop-workers"
     summary = prepare_shard_manifests(input_manifest, shards_dir, run_seed, run_id, source_root)
     ledger = QuotaLedger(ledger_path, output_dir, target, run_id, summary["source_manifest_sha256"])
+    progress_publisher = None
+    if publish_progress:
+        if not dataset_license:
+            raise ValueError("periodic Hugging Face publication requires the reviewed dataset license")
+        try:
+            from .lineforge_hf_publish import ProgressPublisher, validate_progress_clearance
+        except ImportError:  # direct script execution
+            from lineforge_hf_publish import ProgressPublisher, validate_progress_clearance  # type: ignore[no-redef]
+        source_entries = validate_progress_clearance(input_manifest, source_root, dataset_license)
+        token = require_hf_token()
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as exc:
+            raise RuntimeError("install the optional huggingface_hub dependency for progress publication") from exc
+        api = HfApi(token=token)
+        template_path = card_template or (Path(__file__).resolve().parents[1] / "docs" / "huggingface-dataset-card.template.md")
+        progress_publisher = ProgressPublisher(api, run_id, dataset_license, template_path, source_entries)
+        # The uploader keeps its token in memory; worker and monitor subprocesses do not inherit it.
+        os.environ.pop("HF_TOKEN", None)
     script_path = Path(__file__).resolve()
     common = [
         "--linecrop", str(linecrop_binary),
@@ -748,6 +857,7 @@ def dispatch_local_run(
         "--ledger", str(ledger_path),
         "--target", str(target),
         "--dpi", str(dpi),
+        "--stop-file", str(stop_file),
     ]
     monitor_command = [
         sys.executable, str(script_path), "monitor",
@@ -758,10 +868,12 @@ def dispatch_local_run(
         "--target", str(target),
         "--poll-seconds", str(poll_seconds),
         "--timeout-seconds", str(timeout_seconds),
+        "--stop-file", str(stop_file),
     ]
     coordinator: subprocess.Popen[Any] | None = None
     workers: list[subprocess.Popen[Any]] = []
     deadline = time.monotonic() + timeout_seconds
+    last_progress_count = 0
     try:
         print(f"LineForge dispatch: starting {WORKER_COUNT} workers and 1 live coordinator", flush=True)
         coordinator = subprocess.Popen(monitor_command, start_new_session=(os.name == "posix"))
@@ -779,6 +891,13 @@ def dispatch_local_run(
                 raise RuntimeError(f"worker process failure(s): {failed}")
             if coordinator.poll() not in (None, 0):
                 raise RuntimeError(f"live coordinator exited with status {coordinator.returncode}")
+            if progress_publisher is not None and ledger.count() - last_progress_count >= progress_every_images:
+                checkpoint = progress_publisher.publish_checkpoint(ledger)
+                last_progress_count = progress_publisher.last_sequence
+                print(
+                    f"Hugging Face progress: {checkpoint['image_count']} images on {checkpoint['revision']}",
+                    flush=True,
+                )
             if all(process.poll() == 0 for process in workers):
                 break
             remaining = deadline - time.monotonic()
@@ -797,6 +916,14 @@ def dispatch_local_run(
         final = reduce_worker_results(
             results_dir, ledger, run_id, summary["source_manifest_sha256"], target, final_path
         )
+        progress_revision = None
+        if progress_publisher is not None:
+            checkpoint = progress_publisher.publish_checkpoint(ledger)
+            progress_revision = progress_publisher.revision
+            print(
+                f"Hugging Face progress: {checkpoint['image_count']} images on {checkpoint['revision']}",
+                flush=True,
+            )
         dispatch_summary = {
             "run_id": run_id,
             "worker_count": WORKER_COUNT,
@@ -809,6 +936,8 @@ def dispatch_local_run(
             "dataset_manifest": str(final_path),
             "image_directory": str(output_dir / "images"),
         }
+        if progress_revision is not None:
+            dispatch_summary["progress_revision"] = progress_revision
         atomic_write(run_dir / "dispatch-summary.json", json.dumps(dispatch_summary, indent=2, sort_keys=True).encode("utf-8") + b"\n")
         return dispatch_summary
     except BaseException:
@@ -904,7 +1033,7 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
 
 
 def _cmd_worker(args: argparse.Namespace) -> int:
-    result = process_shard(args.shard_manifest, args.linecrop, args.work_dir, args.output_dir, args.ledger, args.target, args.dpi)
+    result = process_shard(args.shard_manifest, args.linecrop, args.work_dir, args.output_dir, args.ledger, args.target, args.dpi, args.stop_file)
     print(result)
     return 0
 
@@ -920,7 +1049,7 @@ def _cmd_reduce(args: argparse.Namespace) -> int:
 def _cmd_monitor(args: argparse.Namespace) -> int:
     run_id, manifest_sha = load_shard_identity(args.shards_dir)
     ledger = QuotaLedger(args.ledger, args.output_dir, args.target, run_id, manifest_sha)
-    result = monitor_local_workers(ledger, args.results_dir, args.poll_seconds, args.timeout_seconds)
+    result = monitor_local_workers(ledger, args.results_dir, args.poll_seconds, args.timeout_seconds, args.stop_file)
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -937,6 +1066,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         args.dpi,
         args.poll_seconds,
         args.timeout_seconds,
+        publish_progress=args.publish_progress,
+        dataset_license=args.dataset_license,
+        progress_every_images=args.progress_every_images,
+        card_template=args.card_template,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -960,6 +1093,7 @@ def main() -> int:
     worker.add_argument("--ledger", type=Path, required=True)
     worker.add_argument("--target", type=int, default=DEFAULT_TARGET)
     worker.add_argument("--dpi", type=int, default=300)
+    worker.add_argument("--stop-file", type=Path)
     worker.set_defaults(func=_cmd_worker)
     reduce = subparsers.add_parser("reduce", help="validate all 19 worker results and emit exact-count provenance")
     reduce.add_argument("--shards-dir", type=Path, required=True)
@@ -977,6 +1111,7 @@ def main() -> int:
     monitor.add_argument("--target", type=int, default=DEFAULT_TARGET)
     monitor.add_argument("--poll-seconds", type=int, default=5)
     monitor.add_argument("--timeout-seconds", type=int, default=21_600)
+    monitor.add_argument("--stop-file", type=Path)
     monitor.set_defaults(func=_cmd_monitor)
     dispatch = subparsers.add_parser("dispatch", help="start 19 LineForge workers and 1 live coordinator on one trusted host")
     dispatch.add_argument("--input-manifest", type=Path, required=True)
@@ -989,6 +1124,10 @@ def main() -> int:
     dispatch.add_argument("--dpi", type=int, default=300)
     dispatch.add_argument("--poll-seconds", type=int, default=5)
     dispatch.add_argument("--timeout-seconds", type=int, default=21_600)
+    dispatch.add_argument("--publish-progress", action="store_true", help="periodically publish sanitized in-progress checkpoints to the public Hub main revision")
+    dispatch.add_argument("--dataset-license")
+    dispatch.add_argument("--progress-every-images", type=int, default=5_000)
+    dispatch.add_argument("--card-template", type=Path)
     dispatch.set_defaults(func=_cmd_dispatch)
     args = parser.parse_args()
     try:

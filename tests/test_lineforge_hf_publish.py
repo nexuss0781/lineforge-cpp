@@ -11,7 +11,12 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 from scripts.lineforge_dataset import QuotaLedger, reduce_worker_results, sha256_file
-from scripts.lineforge_hf_publish import HF_DATASET_REPO, publish_dataset
+from scripts.lineforge_hf_publish import (
+    HF_DATASET_REPO,
+    ProgressPublisher,
+    publish_dataset,
+    validate_progress_clearance,
+)
 
 LICENSE = "cc-by-4.0"
 
@@ -151,6 +156,29 @@ class FakeHfApi:
         self.public_index = json.loads((payload / "lineforge-public-manifest.json").read_text(encoding="utf-8"))
 
 
+class FakeProgressApi:
+    def __init__(self):
+        self.branches = []
+        self.upload_calls = []
+        self.uploaded_image_paths = []
+        self.metadata = {}
+
+    def repo_info(self, **kwargs):
+        return SimpleNamespace(private=False)
+
+    def create_branch(self, **kwargs):
+        self.branches.append(kwargs)
+
+    def upload_folder(self, **kwargs):
+        self.upload_calls.append({key: value for key, value in kwargs.items() if key != "folder_path"})
+        folder = Path(kwargs["folder_path"])
+        files = [path for path in folder.rglob("*") if path.is_file()]
+        if kwargs.get("path_in_repo") == "images":
+            self.uploaded_image_paths.extend(path.relative_to(folder).as_posix() for path in files)
+        else:
+            self.metadata = {path.name: path.read_text(encoding="utf-8") for path in files}
+
+
 class HuggingFacePublisherTests(unittest.TestCase):
     def publish_args(self, fixture: dict) -> tuple:
         return (
@@ -193,6 +221,8 @@ class HuggingFacePublisherTests(unittest.TestCase):
             self.assertNotIn("private-fixture-rights-evidence", api.readme)
             serialized_index = json.dumps(api.public_index)
             self.assertEqual(api.public_index["image_count"], 2)
+            self.assertEqual(api.public_index["release_status"], "complete")
+            self.assertEqual(api.public_index["target_image_count"], 2)
             self.assertNotIn("private-fixture-source-id", serialized_index)
             self.assertNotIn("private-fixture-rights-evidence", serialized_index)
             self.assertNotIn(fixture["source_hash"], serialized_index)
@@ -200,6 +230,47 @@ class HuggingFacePublisherTests(unittest.TestCase):
             self.assertTrue(all(item["source_book"] == "Synthetic Public Book" for item in api.public_index["images"]))
             self.assertTrue(all(item["page_number"] >= 10 and item["line_index"] >= 1 for item in api.public_index["images"]))
             self.assertFalse(any("quota.sqlite" in path or "worker-" in path for path in api.uploaded_files))
+
+    def test_progress_checkpoints_update_main_and_publish_only_sanitized_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = make_fixture(Path(temp))
+            source_rows = validate_progress_clearance(
+                fixture["source_manifest"], fixture["source_root"], LICENSE,
+            )
+            self.assertEqual(len(source_rows), 1)
+            api = FakeProgressApi()
+            publisher = ProgressPublisher(
+                api, "checkpoint-run-42", LICENSE, fixture["card_template"], source_rows,
+            )
+            ledger = QuotaLedger(
+                fixture["run_dir"] / "quota.sqlite",
+                fixture["run_dir"] / "dataset",
+                fixture["target"],
+                "offline-fixture-run",
+                sha256_file(fixture["source_manifest"]),
+            )
+            result = publisher.publish_checkpoint(ledger)
+            self.assertEqual(result["status"], "checkpoint_uploaded")
+            self.assertEqual(result["image_count"], 2)
+            self.assertEqual(result["revision"], "main")
+            self.assertEqual(api.branches, [])
+            self.assertEqual(len(api.upload_calls), 2)
+            self.assertTrue(all(call["revision"] == "main" for call in api.upload_calls))
+            self.assertEqual(len(api.uploaded_image_paths), 2)
+            public_index = json.loads(api.metadata["lineforge-public-manifest.json"])
+            serialized = json.dumps(public_index)
+            self.assertEqual(public_index["release_status"], "in_progress")
+            self.assertEqual(public_index["image_count"], 2)
+            self.assertNotIn("private-fixture-source-id", serialized)
+            self.assertNotIn("private-fixture-rights-evidence", serialized)
+            self.assertNotIn(fixture["source_hash"], serialized)
+            self.assertIn("2 of 2 target line images", api.metadata["README.md"])
+
+    def test_progress_checkpoint_rejects_missing_or_mixed_source_license_clearance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = make_fixture(Path(temp), source_dataset_license=None)
+            with self.assertRaisesRegex(ValueError, "selected dataset license"):
+                validate_progress_clearance(fixture["source_manifest"], fixture["source_root"], LICENSE)
 
     def test_remote_upload_requires_explicit_flag_before_secret_or_network_access(self) -> None:
         with tempfile.TemporaryDirectory() as temp, patch.dict("os.environ", {}, clear=True):
