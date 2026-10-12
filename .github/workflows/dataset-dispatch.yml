@@ -28,7 +28,7 @@ concurrency:
 jobs:
   dispatch:
     if: github.ref == 'refs/heads/main'
-    name: LineForge dataset dispatch (19 workers + live coordinator)
+    name: LineForge dataset dispatch (Telegram fetch + 19 workers + live coordinator)
     runs-on: [self-hosted, linux, x64, lineforge-dataset]
     timeout-minutes: 360
     env:
@@ -38,12 +38,12 @@ jobs:
       - name: Check out LineForge
         uses: actions/checkout@v4
 
-      - name: Validate trusted runner staging and derive output root
+      - name: Validate reviewed metadata and create private run paths
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "$LINEFORGE_SOURCE_ROOT" ]]; then
-            echo "Configure the repository Actions variable LINEFORGE_SOURCE_ROOT to the private staged source directory."
+            echo "Configure the repository Actions variable LINEFORGE_SOURCE_ROOT to the private directory containing the reviewed metadata manifest.json."
             exit 1
           fi
           if [[ "$LINEFORGE_SOURCE_ROOT" != /* ]]; then
@@ -55,29 +55,37 @@ jobs:
           source_root="$(realpath "$LINEFORGE_SOURCE_ROOT")"
           repo_root="$(realpath "$GITHUB_WORKSPACE")"
           if [[ "$source_root" == / ]]; then
-            echo "The filesystem root cannot be used as the source directory."
+            echo "The filesystem root cannot be used as the reviewed metadata directory."
             exit 1
           fi
           case "$source_root/" in
-            "$repo_root/"*) echo "Source staging must be outside the checked-out repository."; exit 1 ;;
+            "$repo_root/"*) echo "Reviewed source metadata must remain outside the checked-out repository."; exit 1 ;;
           esac
           case "$repo_root/" in
-            "$source_root/"*) echo "Source staging must not contain the checked-out repository."; exit 1 ;;
+            "$source_root/"*) echo "Reviewed source metadata must not contain the checked-out repository."; exit 1 ;;
           esac
 
-          output_root="$(realpath -m "$(dirname "$source_root")/lineforge-output")"
+          storage_root="$(dirname "$source_root")"
+          runtime_root="$(realpath -m "$storage_root/lineforge-telegram-$LINEFORGE_RUN_ID")"
+          output_root="$(realpath -m "$storage_root/lineforge-output")"
+          for candidate in "$runtime_root" "$output_root"; do
+            case "$candidate/" in
+              "$repo_root/"*|"$source_root/"*) echo "Runtime PDFs and dataset outputs must remain outside the checkout and reviewed metadata directory."; exit 1 ;;
+            esac
+          done
+          case "$runtime_root/" in
+            "$output_root/"*) echo "Runtime PDF staging must not be inside the persistent dataset output directory."; exit 1 ;;
+          esac
           case "$output_root/" in
-            "$repo_root/"*) echo "Dataset outputs must be outside the checked-out repository."; exit 1 ;;
-            "$source_root/"*) echo "Dataset outputs must not be inside the private source tree."; exit 1 ;;
+            "$runtime_root/"*) echo "Persistent dataset outputs must not be inside temporary Telegram staging."; exit 1 ;;
           esac
-          case "$source_root/" in
-            "$output_root/"*) echo "The private source tree must not be inside the dataset output tree."; exit 1 ;;
-          esac
+          [[ ! -e "$runtime_root" ]]
           mkdir -p "$output_root"
           output_root="$(realpath "$output_root")"
           case "$output_root/" in
-            "$repo_root/"*|"$source_root/"*) echo "Resolved dataset output path overlaps the checkout or private source tree."; exit 1 ;;
+            "$repo_root/"*|"$source_root/"*) echo "Resolved dataset output path overlaps protected inputs."; exit 1 ;;
           esac
+          printf 'LINEFORGE_RUNTIME_SOURCE_ROOT=%s\n' "$runtime_root" >> "$GITHUB_ENV"
           printf 'LINEFORGE_OUTPUT_ROOT=%s\n' "$output_root" >> "$GITHUB_ENV"
 
           command -v cmake
@@ -93,6 +101,45 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
+
+      - name: Install Telegram fetch dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_venv="$RUNNER_TEMP/lineforge-telegram-fetch"
+          python3 -m venv --clear "$fetch_venv"
+          "$fetch_venv/bin/python" -m pip install --disable-pip-version-check \
+            -r "$GITHUB_WORKSPACE/requirements-telegram-fetch.txt"
+
+      - name: Fetch and verify the approved Telegram PDFs once
+        shell: bash
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          LINEFORGE_TELEGRAM_CHAT: ${{ vars.LINEFORGE_TELEGRAM_CHAT || '@et_bookstore' }}
+          PUBLISH_TO_HF: ${{ inputs.publish_to_hf }}
+        run: |
+          set -euo pipefail
+          for name in TELEGRAM_API_ID TELEGRAM_API_HASH TELEGRAM_SESSION; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "The Telegram fetch stage requires the repository Actions secret $name."
+              exit 1
+            fi
+          done
+          echo "::add-mask::$TELEGRAM_API_HASH"
+          echo "::add-mask::$TELEGRAM_SESSION"
+          fetch_args=()
+          if [[ "$PUBLISH_TO_HF" == "true" ]]; then
+            fetch_args+=(--require-dataset-license)
+          fi
+          "$RUNNER_TEMP/lineforge-telegram-fetch/bin/python" \
+            "$GITHUB_WORKSPACE/scripts/lineforge_telegram_fetch.py" \
+            --manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
+            --output-root "$LINEFORGE_RUNTIME_SOURCE_ROOT" \
+            --chat "$LINEFORGE_TELEGRAM_CHAT" \
+            --expected-pdf-count 407 \
+            "${fetch_args[@]}"
 
       - name: Install optional Hugging Face publisher dependencies
         if: ${{ inputs.publish_to_hf }}
@@ -121,8 +168,8 @@ jobs:
           except (OSError, ValueError) as exc:
               raise SystemExit(f"Cannot read the reviewed source manifest: {exc}")
           files = manifest.get("files") if isinstance(manifest, dict) else None
-          if not isinstance(files, list) or not files:
-              raise SystemExit("The reviewed source manifest has no eligible source entries.")
+          if not isinstance(files, list) or len(files) != 407:
+              raise SystemExit("The reviewed source manifest must contain exactly 407 eligible sources.")
 
           licenses = set()
           for index, source in enumerate(files, start=1):
@@ -167,8 +214,8 @@ jobs:
               --card-template "$GITHUB_WORKSPACE/docs/huggingface-dataset-card.template.md")
           fi
           "$dispatch_python" scripts/lineforge_dataset.py dispatch \
-            --input-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
-            --source-root "$LINEFORGE_SOURCE_ROOT" \
+            --input-manifest "$LINEFORGE_RUNTIME_SOURCE_ROOT/manifest.json" \
+            --source-root "$LINEFORGE_RUNTIME_SOURCE_ROOT" \
             --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
             --run-seed "$LINEFORGE_RUN_SEED" \
             --run-id "$LINEFORGE_RUN_ID" \
@@ -193,10 +240,22 @@ jobs:
           "$RUNNER_TEMP/lineforge-hf-publisher/bin/python" \
             "$GITHUB_WORKSPACE/scripts/lineforge_hf_publish.py" \
             --run-dir "$LINEFORGE_OUTPUT_ROOT/$LINEFORGE_RUN_ID" \
-            --source-manifest "$LINEFORGE_SOURCE_ROOT/manifest.json" \
-            --source-root "$LINEFORGE_SOURCE_ROOT" \
+            --source-manifest "$LINEFORGE_RUNTIME_SOURCE_ROOT/manifest.json" \
+            --source-root "$LINEFORGE_RUNTIME_SOURCE_ROOT" \
             --repo-id Nexuss0781/Geez-OCR-Dataset \
             --dataset-license "$LINEFORGE_DATASET_LICENSE" \
             --card-template "$GITHUB_WORKSPACE/docs/huggingface-dataset-card.template.md" \
             --target 100024 \
             --confirm-publish
+
+      - name: Remove temporary Telegram PDF staging
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${LINEFORGE_RUNTIME_SOURCE_ROOT:-}" && -d "$LINEFORGE_RUNTIME_SOURCE_ROOT" ]]; then
+            case "$(realpath "$LINEFORGE_RUNTIME_SOURCE_ROOT")" in
+              "$GITHUB_WORKSPACE"/*) echo "Refusing to clean a Telegram staging path inside the checkout."; exit 1 ;;
+            esac
+            rm -rf -- "$LINEFORGE_RUNTIME_SOURCE_ROOT"
+          fi
