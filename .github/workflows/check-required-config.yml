@@ -21,17 +21,14 @@ jobs:
         shell: bash
         env:
           LINEFORGE_SOURCE_ROOT: ${{ vars.LINEFORGE_SOURCE_ROOT }}
-          LINEFORGE_OUTPUT_ROOT: ${{ vars.LINEFORGE_OUTPUT_ROOT }}
-          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
-          HF_DATASET_LICENSE: ${{ vars.HF_DATASET_LICENSE }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           CHECK_HF_PUBLISH: ${{ inputs.check_hf_publish }}
         run: |
           set -euo pipefail
 
-          required=(LINEFORGE_SOURCE_ROOT LINEFORGE_OUTPUT_ROOT)
+          required=(LINEFORGE_SOURCE_ROOT)
           if [[ "$CHECK_HF_PUBLISH" == "true" ]]; then
-            required+=(HF_DATASET_REPO HF_DATASET_LICENSE HF_TOKEN)
+            required+=(HF_TOKEN)
           fi
 
           missing=()
@@ -41,7 +38,7 @@ jobs:
             fi
           done
 
-          if ((${#missing[@]} > 0)); then
+          if (( ${#missing[@]} > 0 )); then
             printf '::error title=Missing Actions configuration::Unset required variables/secrets: %s\n' "${missing[*]}"
             exit 1
           fi

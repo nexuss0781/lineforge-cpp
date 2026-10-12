@@ -7,8 +7,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from scripts.lineforge_dataset import sha256_file
+from scripts.lineforge_dataset import assign_pdf_shards, sha256_file
 from scripts.lineforge_telegram_stage import (
+    plan_telegram_jobs,
     prepare_manifest,
     rights_template,
     validate_fresh_selection,
@@ -47,6 +48,66 @@ class TelegramSelectionTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "known byte-identical copy"):
             validate_fresh_selection(fresh, contradictory, "@et_bookstore")
+
+    def test_plan_splits_407_selected_pdfs_equally_and_matches_runtime_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected_report = {
+                "source_chat": "@et_bookstore",
+                "files": [
+                    {
+                        "message_id": message_id,
+                        "file_name": f"book-{message_id}.pdf",
+                        "size_bytes": 1000 + message_id,
+                        "sha256": None,
+                        "status": message_id <= 407,
+                        "duplicate": message_id > 407,
+                    }
+                    for message_id in range(1, 422)
+                ],
+            }
+            report_path = root / "selection.json"
+            report_path.write_text(json.dumps(selected_report), encoding="utf-8")
+            plan_dir = root / "private-jobs"
+            result = plan_telegram_jobs(report_path, plan_dir, "stable-plan-seed")
+
+            self.assertEqual(result["selected_pdf_count"], 407)
+            self.assertEqual(result["assigned_pdf_count"], 407)
+            self.assertEqual(result["minimum_pdfs_per_job"], 21)
+            self.assertEqual(result["maximum_pdfs_per_job"], 22)
+            self.assertEqual(result["job_counts"].count(22), 8)
+            self.assertEqual(result["job_counts"].count(21), 11)
+            self.assertFalse(result["ready_for_processing"])
+            self.assertEqual(plan_dir.stat().st_mode & 0o777, 0o700)
+
+            planned_ids = []
+            for shard_id in range(19):
+                payload = json.loads((plan_dir / f"job-{shard_id:02d}.json").read_text(encoding="utf-8"))
+                self.assertEqual(payload["shard_id"], shard_id)
+                self.assertFalse(payload["ready_for_processing"])
+                self.assertEqual(payload["run_seed"], "stable-plan-seed")
+                self.assertEqual(len(payload["files"]), payload["pdf_count"])
+                self.assertEqual((plan_dir / f"job-{shard_id:02d}.json").stat().st_mode & 0o777, 0o600)
+                planned_ids.append({row["pdf_id"] for row in payload["files"]})
+
+            staged_manifest_rows = [
+                {"pdf_id": f"telegram-{message_id}", "pdf_sha256": f"{message_id:064x}", "page_count": 100}
+                for message_id in range(1, 408)
+            ]
+            runtime_assignments = assign_pdf_shards(staged_manifest_rows, run_seed="stable-plan-seed")
+            self.assertEqual(planned_ids, [{row["pdf_id"] for row in shard} for shard in runtime_assignments])
+
+    def test_plan_rejects_selected_known_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report_path = root / "selection.json"
+            report_path.write_text(json.dumps({
+                "source_chat": "@et_bookstore",
+                "files": [{"message_id": 1, "file_name": "copy.pdf", "status": True, "duplicate": True}],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "byte-identical copy"):
+                plan_telegram_jobs(report_path, root / "jobs", "seed")
+            self.assertFalse((root / "jobs").exists())
 
 
 class OfflineManifestPreparationTests(unittest.TestCase):
