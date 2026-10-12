@@ -36,6 +36,12 @@ if(BUILD_TESTING)
   set_tests_properties(lineforge_telegram_stage_unit PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60)
+  add_test(NAME lineforge_telegram_fetch_unit
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_lineforge_telegram_fetch.py)
+  set_tests_properties(lineforge_telegram_fetch_unit PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60)
   add_test(NAME lineforge_pilot_unit
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_lineforge_pilot.py)

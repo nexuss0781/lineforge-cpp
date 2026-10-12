@@ -1,0 +1,2 @@
+Telethon>=1.40,<2
+Pillow>=10,<13
