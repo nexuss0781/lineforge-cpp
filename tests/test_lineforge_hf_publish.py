@@ -43,6 +43,8 @@ def make_fixture(root: Path, *, source_dataset_license: str | None = LICENSE, ta
             "path": "source.pdf",
             "page_count": 30,
             "status": True,
+            "public_source_name": "Synthetic Public Book",
+            "public_source_slug": "synthetic-public-book",
             "redistribution": rights,
         }],
     }
@@ -65,6 +67,8 @@ def make_fixture(root: Path, *, source_dataset_license: str | None = LICENSE, ta
         ledger.accept(image_path, {
             "source_pdf_sha256": source_hash,
             "source_pdf_id": "private-fixture-source-id",
+            "source_book_name": "Synthetic Public Book",
+            "source_book_slug": "synthetic-public-book",
             "page_number": 12 + index,
             "line_index": index + 1,
             "shard_id": index,
@@ -192,6 +196,9 @@ class HuggingFacePublisherTests(unittest.TestCase):
             self.assertNotIn("private-fixture-source-id", serialized_index)
             self.assertNotIn("private-fixture-rights-evidence", serialized_index)
             self.assertNotIn(fixture["source_hash"], serialized_index)
+            self.assertTrue(all(item["path"].startswith("images/synthetic-public-book/page-") for item in api.public_index["images"]))
+            self.assertTrue(all(item["source_book"] == "Synthetic Public Book" for item in api.public_index["images"]))
+            self.assertTrue(all(item["page_number"] >= 10 and item["line_index"] >= 1 for item in api.public_index["images"]))
             self.assertFalse(any("quota.sqlite" in path or "worker-" in path for path in api.uploaded_files))
 
     def test_remote_upload_requires_explicit_flag_before_secret_or_network_access(self) -> None:

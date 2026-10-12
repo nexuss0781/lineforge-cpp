@@ -175,6 +175,8 @@ def run_one_job_pilot(
         result = ledger.accept(crop_path, {
             "source_pdf_sha256": source["pdf_sha256"],
             "source_pdf_id": source["pdf_id"],
+            "source_book_name": source["public_source_name"],
+            "source_book_slug": source["public_source_slug"],
             "page_number": PILOT_PAGE_NUMBER,
             "line_index": line_index,
             "shard_id": 0,

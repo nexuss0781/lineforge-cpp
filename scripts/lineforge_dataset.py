@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,6 +58,17 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def slugify_public_source(value: str) -> str:
+    """Create a stable, path-safe public book directory name from a reviewed label."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("public_source_name must be a non-empty reviewed book label")
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    slug = re.sub(r"[^\w-]+", "-", normalized, flags=re.UNICODE).strip("-_")
+    if not slug or slug in {".", ".."} or len(slug) > 100:
+        raise ValueError("public_source_name cannot be converted to a safe book directory name")
+    return slug
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -102,6 +114,7 @@ def validate_source_manifest(
 
     seen_ids: set[str] = set()
     seen_hashes: set[str] = set()
+    seen_book_slugs: set[str] = set()
     accepted: list[dict[str, Any]] = []
     resolved_root = allowed_root.resolve() if allowed_root is not None else None
     for index, raw in enumerate(files):
@@ -124,6 +137,15 @@ def validate_source_manifest(
             raise ValueError(f"{where}.page_count must be a positive integer")
         if raw.get("status") is not True:
             raise ValueError(f"{where} is not explicitly Status=true")
+        public_name = raw.get("public_source_name")
+        public_slug = raw.get("public_source_slug")
+        if not isinstance(public_name, str) or not public_name.strip():
+            raise ValueError(f"{where}.public_source_name must be a reviewed public book label")
+        if not isinstance(public_slug, str) or public_slug != slugify_public_source(public_name):
+            raise ValueError(f"{where}.public_source_slug must match its safe public book label")
+        if public_slug.casefold() in seen_book_slugs:
+            raise ValueError("public source book directory names must be unique")
+        seen_book_slugs.add(public_slug.casefold())
         if not isinstance(local_path, str) or not local_path.strip():
             raise ValueError(f"{where}.path must identify a local staged PDF")
         rights = raw.get("redistribution")
@@ -278,13 +300,18 @@ class QuotaLedger:
             connection.execute("""CREATE TABLE IF NOT EXISTS images (
                 sequence INTEGER PRIMARY KEY, image_sha256 TEXT NOT NULL UNIQUE,
                 provenance_key TEXT NOT NULL UNIQUE, source_pdf_sha256 TEXT NOT NULL,
-                source_pdf_id TEXT NOT NULL, page_number INTEGER NOT NULL, line_index INTEGER NOT NULL,
+                source_pdf_id TEXT NOT NULL, source_book_name TEXT NOT NULL,
+                source_book_slug TEXT NOT NULL, page_number INTEGER NOT NULL, line_index INTEGER NOT NULL,
                 shard_id INTEGER NOT NULL, engine_version TEXT NOT NULL,
                 source_license TEXT NOT NULL, rights_evidence_ref TEXT NOT NULL,
                 relative_path TEXT NOT NULL)""")
             image_columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
             if "source_pdf_id" not in image_columns:
                 connection.execute("ALTER TABLE images ADD COLUMN source_pdf_id TEXT NOT NULL DEFAULT ''")
+            if "source_book_name" not in image_columns:
+                connection.execute("ALTER TABLE images ADD COLUMN source_book_name TEXT NOT NULL DEFAULT ''")
+            if "source_book_slug" not in image_columns:
+                connection.execute("ALTER TABLE images ADD COLUMN source_book_slug TEXT NOT NULL DEFAULT ''")
             if "rights_evidence_ref" not in image_columns:
                 connection.execute("ALTER TABLE images ADD COLUMN rights_evidence_ref TEXT NOT NULL DEFAULT ''")
             stored = connection.execute("SELECT target, run_id, manifest_sha256 FROM metadata WHERE id=1").fetchone()
@@ -316,7 +343,7 @@ class QuotaLedger:
 
     def accept(self, image_path: Path, record: dict[str, Any]) -> str:
         required = (
-            "source_pdf_sha256", "source_pdf_id", "page_number", "line_index",
+            "source_pdf_sha256", "source_pdf_id", "source_book_name", "source_book_slug", "page_number", "line_index",
             "shard_id", "source_license", "rights_evidence_ref",
         )
         if any(key not in record for key in required):
@@ -334,12 +361,19 @@ class QuotaLedger:
             raise ValueError("source_license must be a non-empty rights declaration")
         if not isinstance(record["source_pdf_id"], str) or not record["source_pdf_id"].strip():
             raise ValueError("source_pdf_id must be a non-empty provenance identifier")
+        if not isinstance(record["source_book_name"], str) or not record["source_book_name"].strip():
+            raise ValueError("source_book_name must be a non-empty reviewed public label")
+        if record["source_book_slug"] != slugify_public_source(record["source_book_name"]):
+            raise ValueError("source_book_slug must match its safe public book label")
         if not isinstance(record["rights_evidence_ref"], str) or not record["rights_evidence_ref"].strip():
             raise ValueError("rights_evidence_ref must identify the private rights evidence")
         image_bytes = image_path.read_bytes()
         image_hash = sha256_bytes(image_bytes)
         provenance_key = f"{source_hash}:{record['page_number']}:{record['line_index']}"
-        relative_path = Path("images") / image_hash[:2] / f"{image_hash}.png"
+        relative_path = (
+            Path("images") / record["source_book_slug"] / f"page-{record['page_number']:05d}"
+            / f"line-{record['line_index']:06d}-{image_hash[:12]}.png"
+        )
         destination = self.output_dir / relative_path
 
         with self._connection() as connection:
@@ -362,8 +396,9 @@ class QuotaLedger:
                 atomic_write(destination, image_bytes)
             try:
                 connection.execute(
-                    "INSERT INTO images(sequence,image_sha256,provenance_key,source_pdf_sha256,source_pdf_id,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (current + 1, image_hash, provenance_key, source_hash, record["source_pdf_id"], record["page_number"],
+                    "INSERT INTO images(sequence,image_sha256,provenance_key,source_pdf_sha256,source_pdf_id,source_book_name,source_book_slug,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (current + 1, image_hash, provenance_key, source_hash, record["source_pdf_id"],
+                     record["source_book_name"], record["source_book_slug"], record["page_number"],
                      record["line_index"], record["shard_id"], record.get("engine_version", ENGINE_VERSION),
                      record["source_license"], record["rights_evidence_ref"],
                      str(relative_path.as_posix())),
@@ -377,9 +412,9 @@ class QuotaLedger:
     def records(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT sequence,image_sha256,source_pdf_sha256,source_pdf_id,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path FROM images ORDER BY sequence"
+                "SELECT sequence,image_sha256,source_pdf_sha256,source_pdf_id,source_book_name,source_book_slug,page_number,line_index,shard_id,engine_version,source_license,rights_evidence_ref,relative_path FROM images ORDER BY sequence"
             ).fetchall()
-        fields = ("sequence", "image_sha256", "source_pdf_sha256", "source_pdf_id", "page_number", "line_index", "shard_id", "engine_version", "source_license", "rights_evidence_ref", "relative_path")
+        fields = ("sequence", "image_sha256", "source_pdf_sha256", "source_pdf_id", "source_book_name", "source_book_slug", "page_number", "line_index", "shard_id", "engine_version", "source_license", "rights_evidence_ref", "relative_path")
         return [dict(zip(fields, row)) for row in rows]
 
 
@@ -598,6 +633,8 @@ def process_shard(
                 result = ledger.accept(crop_path, {
                     "source_pdf_sha256": pdf["pdf_sha256"],
                     "source_pdf_id": pdf["pdf_id"],
+                    "source_book_name": pdf["public_source_name"],
+                    "source_book_slug": pdf["public_source_slug"],
                     "page_number": page_number,
                     "line_index": line_index,
                     "shard_id": shard_id,
@@ -833,7 +870,10 @@ def reduce_worker_results(results_dir: Path, ledger: QuotaLedger, run_id: str, m
     for row in records:
         if row["page_number"] < MIN_PAGE:
             raise ValueError("final output contains a crop from before page 10")
-        if not row["source_pdf_id"] or not row["source_license"] or not row["rights_evidence_ref"]:
+        if (
+            not row["source_pdf_id"] or not row["source_license"] or not row["rights_evidence_ref"]
+            or not row["source_book_name"] or row["source_book_slug"] != slugify_public_source(row["source_book_name"])
+        ):
             raise ValueError("final output is missing source or redistribution-rights provenance")
         image_path = ledger.output_dir / row["relative_path"]
         if not image_path.is_file() or sha256_file(image_path) != row["image_sha256"]:
