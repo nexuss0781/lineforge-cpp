@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import unicodedata
@@ -18,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .lineforge_dataset import atomic_write, load_json, sha256_file, slugify_public_source, validate_source_manifest
+    from .lineforge_dataset import assign_even_shards, atomic_write, load_json, sha256_file, slugify_public_source, validate_source_manifest
 except ImportError:  # direct script execution
-    from lineforge_dataset import atomic_write, load_json, sha256_file, slugify_public_source, validate_source_manifest  # type: ignore[no-redef]
+    from lineforge_dataset import assign_even_shards, atomic_write, load_json, sha256_file, slugify_public_source, validate_source_manifest  # type: ignore[no-redef]
 
 DEFAULT_CHAT = "@et_bookstore"
 LINEFORGE_ROOT = Path(__file__).resolve().parents[1]
@@ -82,6 +83,104 @@ def _message_map(rows: list[dict[str, Any]], description: str) -> dict[int, dict
             raise ValueError(f"{description} contains a duplicate Telegram message ID")
         result[message_id] = row
     return result
+
+
+def plan_telegram_jobs(
+    selection_report_path: Path,
+    output_dir: Path,
+    run_seed: str | None = None,
+) -> dict[str, Any]:
+    """Make a private, metadata-only 19-job plan from Status=true, non-duplicate PDFs."""
+    selection_report_path = selection_report_path.expanduser()
+    if selection_report_path.is_symlink() or not selection_report_path.is_file():
+        raise ValueError("selection report must be a regular local JSON file")
+    selection_report_path = selection_report_path.resolve(strict=True)
+    report = load_json(selection_report_path)
+    if not isinstance(report, dict) or not isinstance(report.get("source_chat"), str) or not report["source_chat"].strip():
+        raise ValueError("selection report must identify its Telegram source channel")
+    rows = _message_map(_rows(report, "selection report"), "selection report")
+    if run_seed is None:
+        run_seed = secrets.token_hex(16)
+    if not isinstance(run_seed, str) or not run_seed.strip():
+        raise ValueError("run_seed must be a non-empty string")
+
+    selected: list[dict[str, Any]] = []
+    for message_id, row in sorted(rows.items()):
+        status = row.get("status")
+        duplicate = row.get("duplicate")
+        if type(status) is not bool or type(duplicate) is not bool:
+            raise ValueError("every selection row must have explicit Boolean status and duplicate fields")
+        if status and duplicate:
+            raise ValueError("a known byte-identical copy cannot be included in a Status=true job plan")
+        if not status:
+            continue
+        file_name = row.get("file_name")
+        if not isinstance(file_name, str) or not file_name.strip():
+            raise ValueError("every selected PDF must have a non-empty file_name")
+        byte_size = row.get("size_bytes")
+        if byte_size is not None and (type(byte_size) is not int or byte_size < 0):
+            raise ValueError("selected PDF size_bytes must be a non-negative integer when present")
+        digest = row.get("sha256")
+        if digest is not None and (
+            not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError("selected PDF SHA-256 must be a lowercase 64-character digest when present")
+        selected.append({
+            "pdf_id": f"telegram-{message_id}",
+            "message_id": message_id,
+            "file_name": file_name,
+            "size_bytes": byte_size,
+            "expected_sha256": digest,
+        })
+    if not selected:
+        raise ValueError("selection report contains no Status=true, non-duplicate PDFs")
+
+    shards = assign_even_shards(selected, run_seed=run_seed)
+    output_dir = _secure_directory(output_dir, must_be_new=True)
+    report_digest = sha256_file(selection_report_path)
+    for shard_id, files in enumerate(shards):
+        payload = {
+            "schema_version": 1,
+            "plan_type": "telegram-pdf-equal-count-job-plan",
+            "run_seed": run_seed,
+            "selection_report_sha256": report_digest,
+            "source_chat": report["source_chat"],
+            "worker_count": 19,
+            "shard_id": shard_id,
+            "pdf_count": len(files),
+            "ready_for_processing": False,
+            "files": files,
+        }
+        path = output_dir / f"job-{shard_id:02d}.json"
+        atomic_write(path, json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    counts = [len(shard) for shard in shards]
+    summary = {
+        "schema_version": 1,
+        "plan_type": "telegram-pdf-equal-count-job-plan",
+        "run_seed": run_seed,
+        "selection_report_sha256": report_digest,
+        "source_chat": report["source_chat"],
+        "worker_count": 19,
+        "selected_pdf_count": len(selected),
+        "assigned_pdf_count": sum(counts),
+        "minimum_pdfs_per_job": min(counts),
+        "maximum_pdfs_per_job": max(counts),
+        "job_counts": counts,
+        "ready_for_processing": False,
+        "next_step": "Fetch and checksum the selected PDFs, inspect page counts, then complete source-specific rights review before dispatch.",
+    }
+    summary_path = output_dir / "assignment-summary.json"
+    atomic_write(summary_path, json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n")
+    try:
+        os.chmod(summary_path, 0o600)
+    except OSError:
+        pass
+    return {**summary, "output_dir": str(output_dir), "summary_path": str(summary_path)}
 
 
 def _validate_inventory(inventory: Any) -> list[dict[str, Any]]:
@@ -460,6 +559,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local Telegram intake and rights-gated manifest preparation for LineForge")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    plan = commands.add_parser("plan", help="split a reviewed PDF inventory into 19 private, equal-count job files without contacting Telegram")
+    plan.add_argument("--selection-report", type=Path, required=True)
+    plan.add_argument("--output-dir", type=Path, required=True)
+    plan.add_argument("--run-seed", help="reproducible assignment and page-sampling seed (generated if omitted)")
+
     fetch = commands.add_parser("fetch", help="fresh-scan the channel and download only reviewed Status=true PDFs locally")
     fetch.add_argument("--bridge-root", type=Path, default=Path(os.environ.get("LINEFORGE_TELEGRAM_BRIDGE_ROOT", "/workspace/telegram-file-bridge")))
     fetch.add_argument(
@@ -484,7 +588,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "fetch":
+        if args.command == "plan":
+            result = plan_telegram_jobs(args.selection_report, args.output_dir, args.run_seed)
+        elif args.command == "fetch":
             env_file = args.env_file or args.bridge_root / ".env"
             result = fetch_sources(args.bridge_root, env_file, args.selection_report, args.stage_root, args.chat)
         elif args.command == "rights-template":
