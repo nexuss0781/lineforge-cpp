@@ -61,6 +61,8 @@ def make_record(shard_id: int, page: int = 10, line_index: int = 1, pdf_hash: st
     return {
         "source_pdf_sha256": pdf_hash or digest(f"pdf-{shard_id}-{page}-{line_index}"),
         "source_pdf_id": f"private-pdf-{shard_id}",
+        "source_book_name": f"Synthetic Book {shard_id}",
+        "source_book_slug": f"synthetic-book-{shard_id}",
         "page_number": page,
         "line_index": line_index,
         "shard_id": shard_id,
@@ -87,6 +89,8 @@ class ManifestTests(unittest.TestCase):
                     "page_count": 30,
                     "byte_size": pdf.stat().st_size,
                     "status": True,
+                    "public_source_name": "Synthetic Book One",
+                    "public_source_slug": "synthetic-book-one",
                     "redistribution": {"allowed": True, "license": "CC0-1.0", "evidence_ref": "fixture"},
                 }],
             }
@@ -118,6 +122,7 @@ class ManifestTests(unittest.TestCase):
                 return {
                     "pdf_id": pdf_id, "pdf_sha256": sha256_file(pdf), "path": str(pdf),
                     "page_count": pages, "status": True,
+                    "public_source_name": pdf_id, "public_source_slug": pdf_id,
                     "redistribution": {"allowed": True, "license": "CC0-1.0", "evidence_ref": "fixture"},
                 }
             doc = {"schema_version": 1, "dataset_id": "x", "revision": "r1", "files": [row(short, "short", 9), row(full, "full", 20)]}
@@ -340,6 +345,8 @@ class DispatcherIntegrationTests(unittest.TestCase):
                     "path": "sample.pdf",
                     "page_count": 12,
                     "status": True,
+                    "public_source_name": "Synthetic Integration Book",
+                    "public_source_slug": "synthetic-integration-book",
                     "redistribution": {
                         "allowed": True,
                         "license": "CC0-1.0",

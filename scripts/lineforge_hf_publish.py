@@ -29,6 +29,7 @@ try:  # Supports both `python scripts/lineforge_hf_publish.py` and package tests
         load_json,
         require_hf_token,
         sha256_file,
+        slugify_public_source,
         validate_source_manifest,
     )
 except ImportError:  # pragma: no cover - exercised by direct CLI execution.
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover - exercised by direct CLI execution.
         load_json,
         require_hf_token,
         sha256_file,
+        slugify_public_source,
         validate_source_manifest,
     )
 
@@ -48,7 +50,7 @@ PUBLIC_INDEX_NAME = "lineforge-public-manifest.json"
 LICENSE_PLACEHOLDER = "{{DATASET_LICENSE}}"
 _IMAGE_COLUMNS = (
     "sequence", "image_sha256", "provenance_key", "source_pdf_sha256",
-    "source_pdf_id", "page_number", "line_index", "shard_id",
+    "source_pdf_id", "source_book_name", "source_book_slug", "page_number", "line_index", "shard_id",
     "engine_version", "source_license", "rights_evidence_ref", "relative_path",
 )
 
@@ -293,6 +295,9 @@ def validate_publication(
         rights = source["redistribution"]
         if (
             row.get("source_pdf_id") != source["pdf_id"]
+            or row.get("source_book_name") != source["public_source_name"]
+            or row.get("source_book_slug") != source["public_source_slug"]
+            or row.get("source_book_slug") != slugify_public_source(row.get("source_book_name", ""))
             or row.get("source_license") != rights["license"]
             or row.get("rights_evidence_ref") != rights["evidence_ref"]
             or type(row.get("page_number")) is not int
@@ -310,9 +315,12 @@ def validate_publication(
         if ledger_records[sequence - 1].get("provenance_key") != provenance or provenance in seen_provenance:
             raise ValueError("image provenance keys are malformed or duplicated")
         seen_provenance.add(provenance)
-        expected_relative = f"images/{image_hash[:2]}/{image_hash}.png"
+        expected_relative = (
+            f"images/{source['public_source_slug']}/page-{row['page_number']:05d}/"
+            f"line-{row['line_index']:06d}-{image_hash[:12]}.png"
+        )
         if row.get("relative_path") != expected_relative:
-            raise ValueError("image path is not content-addressed by its validated SHA-256")
+            raise ValueError("image path does not match its validated source book, page, line, and checksum")
         image_path = dataset_dir / expected_relative
         if image_path.is_symlink() or not image_path.is_file():
             raise ValueError("a validated dataset image is missing or unsafe")
@@ -329,7 +337,13 @@ def validate_publication(
         "dataset_license": dataset_license,
         "image_count": expected_target,
         "images": [
-            {"path": row["relative_path"], "sha256": row["image_sha256"]}
+            {
+                "path": row["relative_path"],
+                "sha256": row["image_sha256"],
+                "source_book": row["source_book_name"],
+                "page_number": row["page_number"],
+                "line_index": row["line_index"],
+            }
             for row in manifest["images"]
         ],
     }

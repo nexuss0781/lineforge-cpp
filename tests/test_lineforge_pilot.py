@@ -34,6 +34,8 @@ class OneJobPilotTests(unittest.TestCase):
                 "page_count": page_count,
                 "byte_size": pdf_path.stat().st_size,
                 "status": True,
+                "public_source_name": "Synthetic Pilot Book",
+                "public_source_slug": "synthetic-pilot-book",
                 "redistribution": {
                     "allowed": True,
                     "license": "CC0-1.0",
