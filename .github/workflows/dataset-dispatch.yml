@@ -10,7 +10,7 @@ on:
       publish_to_hf:
         description: Publish in-progress checkpoints to public main, then the validated 100,024-image release
         required: false
-        default: false
+        default: true
         type: boolean
       checkpoint_images:
         description: Upload a progress checkpoint after this many newly accepted images
